@@ -18,47 +18,56 @@ app.get("/", (req, res) => {
   res.send("P2P Backend Server Active!");
 });
 
-const rooms = {};
+// Do users ko track karne ke liye array
+let activeUsers = [];
 
 io.on("connection", (socket) => {
   console.log("User Connected:", socket.id);
 
-  // Room Join & Presence logic
-  socket.on("join-room", (roomId) => {
-    socket.join(roomId);
+  // Agar room me pehle se 2 log hain toh teesre ko block karein
+  if (activeUsers.length >= 2) {
+    socket.emit("room_full");
+    socket.disconnect(true);
+    return;
+  }
 
-    if (!rooms[roomId]) {
-      rooms[roomId] = [];
-    }
-    rooms[roomId].push(socket.id);
+  activeUsers.push(socket.id);
 
-    // Jab doosra user room join kare toh Online status emit karein
-    if (rooms[roomId].length >= 2) {
-      io.to(roomId).emit("user-connected", {
-        status: "Online",
-        users: rooms[roomId]
-      });
-    }
+  // Jab 2 users connect ho jayein toh dono ko Online status aur WebRTC role assign karein
+  if (activeUsers.length === 2) {
+    io.emit("user_status", { online: true });
+
+    // Polite / Impolite peer assignment (WebRTC collision se bachne ke liye)
+    io.to(activeUsers[0]).emit("peer-ready", { polite: false });
+    io.to(activeUsers[1]).emit("peer-ready", { polite: true });
+  } else {
+    // Sirf 1 user hone par Offline status dikhayenge
+    socket.emit("user_status", { online: false });
+  }
+
+  // 1. WebRTC Signaling relay (Offer, Answer, ICE Candidates)
+  socket.on("signal", (data) => {
+    socket.broadcast.emit("signal", data);
   });
 
-  // WebRTC Signaling (Call / Media)
-  socket.on("offer", (data) => socket.to(data.roomId).emit("offer", data));
-  socket.on("answer", (data) => socket.to(data.roomId).emit("answer", data));
-  socket.on("ice-candidate", (data) => socket.to(data.roomId).emit("ice-candidate", data));
+  // 2. Chat messaging relay
+  socket.on("chat-message", (msg) => {
+    socket.broadcast.emit("chat-message", msg);
+  });
 
-  // Chat message relay
-  socket.on("send-message", (data) => socket.to(data.roomId).emit("receive-message", data));
+  // 3. Media / File transfer relay
+  socket.on("file-transfer", (mediaData) => {
+    socket.broadcast.emit("file-transfer", mediaData);
+  });
 
-  // Disconnect & Offline Status
+  // Disconnect hone par cleanup
   socket.on("disconnect", () => {
-    for (const roomId in rooms) {
-      const index = rooms[roomId].indexOf(socket.id);
-      if (index !== -1) {
-        rooms[roomId].splice(index, 1);
-        io.to(roomId).emit("user-disconnected", { status: "Offline" });
-        if (rooms[roomId].length === 0) delete rooms[roomId];
-      }
-    }
+    console.log("User Disconnected:", socket.id);
+    activeUsers = activeUsers.filter((id) => id !== socket.id);
+
+    // Bacha hua user wapas offline status dekhega
+    socket.broadcast.emit("peer-left");
+    socket.broadcast.emit("user_status", { online: false });
   });
 });
 
