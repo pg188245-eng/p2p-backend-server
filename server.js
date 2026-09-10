@@ -45,6 +45,12 @@ io.on("connection", (socket) => {
     socket.emit("user_status", { online: false });
   }
 
+  // Room Reset handler (Fix for ghost users & room locking)
+  socket.on("reset_room", () => {
+    activeUsers = [];
+    io.emit("room_reset_kick");
+  });
+
   // 1. WebRTC Signaling relay (Offer, Answer, ICE Candidates)
   socket.on("signal", (data) => {
     socket.broadcast.emit("signal", data);
