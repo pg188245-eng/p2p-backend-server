@@ -108,6 +108,34 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- NAYA CODE: Manual Leave Room (Taki spot khali ho aur naya room ban sake) ---
+  socket.on('leave_room', (data) => {
+    if (currentRoom) {
+      const userId = data.userId;
+      
+      // Socket ko room se bahar nikalo
+      socket.leave(currentRoom);
+      socket.to(currentRoom).emit('user_status', { online: false });
+      socket.to(currentRoom).emit('peer-left');
+
+      // Room ke lock (Set) mein se sirf IS user ki ID remove karo
+      if (roomsStore[currentRoom] && userId) {
+        roomsStore[currentRoom].allowedUsers.delete(userId);
+        
+        // Agar room mein koi allowed user nahi bacha, toh room ka lock poora delete kar do
+        if (roomsStore[currentRoom].allowedUsers.size === 0) {
+          delete roomsStore[currentRoom];
+          console.log(`Room "${currentRoom}" ke sabhi users leave kar gaye. Lock completely deleted!`);
+        } else {
+          console.log(`User ${userId} left room "${currentRoom}". 1 spot free!`);
+        }
+      }
+
+      currentRoom = null;
+    }
+  });
+  // ----------------------------------------------------------------------------------
+
   // Disconnect Handling & Lock Cleanup
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
