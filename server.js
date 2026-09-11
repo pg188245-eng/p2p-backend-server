@@ -19,66 +19,67 @@ app.get('/', (req, res) => {
   res.send('PairLink2 Backend is running!');
 });
 
+// Locked Rooms Store: Tracks permanent user IDs allowed in each room
+const roomsStore = {};
+
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
-  // Manual Room Join
-  socket.on('join_room', (roomName) => {
-    const room = io.sockets.adapter.rooms.get(roomName);
-    const numClients = room ? room.size : 0;
+  // Strict Room Locking & Joining Logic
+  function handleJoinRoom(data) {
+    const roomName = typeof data === 'object' ? data.room : data;
+    const userId = (typeof data === 'object' && data.userId) ? data.userId : socket.id;
 
-    if (numClients >= 2) {
-      socket.emit('room_full', { room: roomName });
-      return;
+    if (!roomName) return;
+
+    // 1. Check & Apply Room Lock Logic
+    if (!roomsStore[roomName]) {
+      // Pehla User: Room create hua
+      roomsStore[roomName] = { allowedUsers: new Set([userId]) };
+    } else if (!roomsStore[roomName].allowedUsers.has(userId)) {
+      // Agar naya user enter karne ki koshish kar raha hai
+      if (roomsStore[roomName].allowedUsers.size >= 2) {
+        // Room me pehle se 2 locked users maujood hain -> Reject 3rd User
+        socket.emit('room_locked_error', { 
+          message: 'Yeh room locked hai! Is room ke 2 users fixed hain, koi teesra enter nahi ho sakta.' 
+        });
+        return;
+      } else {
+        // Doosra User: Register karo aur room ko lock kar do
+        roomsStore[roomName].allowedUsers.add(userId);
+      }
     }
 
+    // 2. Allow Joining
     socket.join(roomName);
     currentRoom = roomName;
     socket.emit('room_joined', { room: roomName });
 
-    const updatedRoom = io.sockets.adapter.rooms.get(roomName);
-    const count = updatedRoom ? updatedRoom.size : 0;
+    const room = io.sockets.adapter.rooms.get(roomName);
+    const socketsInRoom = room ? Array.from(room) : [];
 
-    if (count === 2) {
+    if (socketsInRoom.length >= 2) {
       io.to(roomName).emit('user_status', { online: true });
-      const socketsInRoom = Array.from(updatedRoom);
-      io.to(socketsInRoom[0]).emit('peer-ready', { polite: false });
-      io.to(socketsInRoom[1]).emit('peer-ready', { polite: true });
+      
+      const s1 = socketsInRoom[socketsInRoom.length - 2];
+      const s2 = socketsInRoom[socketsInRoom.length - 1];
+      
+      io.to(s1).emit('peer-ready', { polite: false });
+      io.to(s2).emit('peer-ready', { polite: true });
     } else {
       socket.emit('user_status', { online: false });
     }
+  }
+
+  // Manual Room Join
+  socket.on('join_room', (data) => {
+    handleJoinRoom(data);
   });
 
-  // Auto-Rejoin Logic (localStorage)
-  socket.on('rejoin_room', (roomName) => {
-    const room = io.sockets.adapter.rooms.get(roomName);
-    const numClients = room ? room.size : 0;
-
-    // Room khali hone par expired popup
-    if (numClients === 0) {
-      socket.emit('room_expired');
-      return;
-    }
-
-    // Room full hone par alert
-    if (numClients >= 2) {
-      socket.emit('room_full', { room: roomName });
-      return;
-    }
-
-    // Single user hone par direct rejoin
-    socket.join(roomName);
-    currentRoom = roomName;
-    socket.emit('room_joined', { room: roomName });
-
-    const updatedRoom = io.sockets.adapter.rooms.get(roomName);
-    if (updatedRoom && updatedRoom.size === 2) {
-      io.to(roomName).emit('user_status', { online: true });
-      const socketsInRoom = Array.from(updatedRoom);
-      io.to(socketsInRoom[0]).emit('peer-ready', { polite: false });
-      io.to(socketsInRoom[1]).emit('peer-ready', { polite: true });
-    }
+  // Auto-Rejoin Logic
+  socket.on('rejoin_room', (data) => {
+    handleJoinRoom(data);
   });
 
   // Data Broadcast Handlers
@@ -102,16 +103,24 @@ io.on('connection', (socket) => {
   
   socket.on('reset_room', () => {
     if (currentRoom) {
+      delete roomsStore[currentRoom];
       io.to(currentRoom).emit('room_reset_kick');
     }
   });
 
-  // Disconnect Handling
+  // Disconnect Handling & Lock Cleanup
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     if (currentRoom) {
       socket.to(currentRoom).emit('user_status', { online: false });
       socket.to(currentRoom).emit('peer-left');
+
+      // Jab dono users disconnect ho jayen (Active Sockets = 0), toh Room Lock Delete kar do
+      const room = io.sockets.adapter.rooms.get(currentRoom);
+      if (!room || room.size === 0) {
+        delete roomsStore[currentRoom];
+        console.log(`Room "${currentRoom}" khali ho gaya. Lock deleted!`);
+      }
     }
   });
 });
