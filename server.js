@@ -21,7 +21,7 @@ app.get('/', (req, res) => {
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    // Password validation aur Dynamic Room logic[cite: 7]
+    // Dynamic Password Room Join Logic[cite: 7]
     socket.on('join-room', (password) => {
         if (!password || typeof password !== 'string') return;
         const cleanPass = password.trim();
@@ -31,26 +31,26 @@ io.on('connection', (socket) => {
         const currentRoom = io.sockets.adapter.rooms.get(roomId);
         const numClients = currentRoom ? currentRoom.size : 0;
 
-        // 1. CHANCE: Room nahi hai (0 users) -> Naya Room Banao
+        // 1. Room nahi hai -> Create new room[cite: 7]
         if (numClients === 0) {
             socket.join(roomId);
             socket.roomId = roomId;
             socket.userPassword = cleanPass;
-            socket.isPolite = false; // Pehla user (Impolite)[cite: 7]
+            socket.isPolite = false; // Master User[cite: 7]
 
             socket.emit('room_created', {
                 roomId: roomId,
                 password: cleanPass,
                 isPolite: false
             });
-            console.log(`Naya room bana pass '${cleanPass}' ke sath: ${socket.id}`);
+            console.log(`Room created with password '${cleanPass}': ${socket.id}`);
         } 
-        // 2. CHANCE: Room pehle se hai aur 1 banda hai -> Join Karo
+        // 2. Room me 1 banda hai -> Join existing room[cite: 7]
         else if (numClients === 1) {
             socket.join(roomId);
             socket.roomId = roomId;
             socket.userPassword = cleanPass;
-            socket.isPolite = true; // Doosra user (Polite)[cite: 7]
+            socket.isPolite = true; // Polite User[cite: 7]
 
             socket.emit('room_joined', {
                 roomId: roomId,
@@ -58,30 +58,35 @@ io.on('connection', (socket) => {
                 isPolite: true
             });
 
-            // Dono users ko connection start karne ka signal bhejo
+            // Room me dono users ko connectivity ka signal bhejo
             io.to(roomId).emit('user_connected', { numClients: 2 });
             console.log(`User ${socket.id} joined room '${cleanPass}'`);
         } 
-        // 3. CHANCE: Room full hai (2 log pehle se hain) -> Block Karo[cite: 7]
+        // 3. Room full hai (2 users pehle se hain) -> Reject[cite: 7]
         else {
             socket.emit('room_full', 'Yeh room full ho chuka hai! Kisi aur password se try karein.');
-            console.log(`Room '${cleanPass}' full hai. ${socket.id} reject hua.`);
+            console.log(`Rejected ${socket.id} from full room '${cleanPass}'`);
         }
     });
 
-    // WebRTC Signaling Data Routing[cite: 7]
+    // WebRTC Signaling Data Exchange[cite: 7]
     socket.on('signal', (data) => {
         if (socket.roomId) {
             socket.to(socket.roomId).emit('signal', data);
         }
     });
 
-    // Disconnect Handler: User ke nikalte hi room khali kar do
+    // Chat Message Relay
+    socket.on('chat_message', (data) => {
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('chat_message', data);
+        }
+    });
+
+    // Disconnect Handler: User ke nikalte hi room dismantle kar do
     socket.on('disconnect', () => {
         if (socket.roomId) {
-            // Room me majood doosre user ko disconnect alert bhejo
             socket.to(socket.roomId).emit('user_disconnected');
-            // Socket ko room se leave karwa do
             socket.leave(socket.roomId);
         }
         console.log('User disconnected:', socket.id);
