@@ -16,80 +16,102 @@ const io = new Server(server, {
 });
 
 app.get('/', (req, res) => {
-  res.send('PairLink2 Multi-Room Backend is running!');
+  res.send('PairLink2 Backend is running!');
 });
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
+  let currentRoom = null;
 
-  // User jab room name submit kare
+  // Manual Room Join
   socket.on('join_room', (roomName) => {
-    if (!roomName) return;
+    const room = io.sockets.adapter.rooms.get(roomName);
+    const numClients = room ? room.size : 0;
 
-    const room = roomName.trim().toLowerCase();
-
-    // Check room active users count
-    const clientsInRoom = io.sockets.adapter.rooms.get(room);
-    const numClients = clientsInRoom ? clientsInRoom.size : 0;
-
-    // Room mein 2 log pehle se hain
     if (numClients >= 2) {
-      socket.emit('room_full', { room });
+      socket.emit('room_full', { room: roomName });
       return;
     }
 
-    socket.join(room);
-    socket.currentRoom = room;
+    socket.join(roomName);
+    currentRoom = roomName;
+    socket.emit('room_joined', { room: roomName });
 
-    console.log(`User ${socket.id} joined room: "${room}" (Total: ${numClients + 1})`);
+    const updatedRoom = io.sockets.adapter.rooms.get(roomName);
+    const count = updatedRoom ? updatedRoom.size : 0;
 
-    // Pehla user connected
-    if (numClients === 0) {
-      socket.emit('room_joined', { room, isInitiator: true });
+    if (count === 2) {
+      io.to(roomName).emit('user_status', { online: true });
+      const socketsInRoom = Array.from(updatedRoom);
+      io.to(socketsInRoom[0]).emit('peer-ready', { polite: false });
+      io.to(socketsInRoom[1]).emit('peer-ready', { polite: true });
+    } else {
       socket.emit('user_status', { online: false });
-    } 
-    // Dusra user connected
-    else if (numClients === 1) {
-      socket.emit('room_joined', { room, isInitiator: false });
-      
-      io.in(room).emit('user_status', { online: true });
-
-      // Perfect Negotiation roles
-      socket.emit('peer-ready', { polite: true });
-      socket.to(room).emit('peer-ready', { polite: false });
     }
   });
 
-  // Relay signals exclusively to the same room
+  // Auto-Rejoin Logic (localStorage)
+  socket.on('rejoin_room', (roomName) => {
+    const room = io.sockets.adapter.rooms.get(roomName);
+    const numClients = room ? room.size : 0;
+
+    // Room khali hone par expired popup
+    if (numClients === 0) {
+      socket.emit('room_expired');
+      return;
+    }
+
+    // Room full hone par alert
+    if (numClients >= 2) {
+      socket.emit('room_full', { room: roomName });
+      return;
+    }
+
+    // Single user hone par direct rejoin
+    socket.join(roomName);
+    currentRoom = roomName;
+    socket.emit('room_joined', { room: roomName });
+
+    const updatedRoom = io.sockets.adapter.rooms.get(roomName);
+    if (updatedRoom && updatedRoom.size === 2) {
+      io.to(roomName).emit('user_status', { online: true });
+      const socketsInRoom = Array.from(updatedRoom);
+      io.to(socketsInRoom[0]).emit('peer-ready', { polite: false });
+      io.to(socketsInRoom[1]).emit('peer-ready', { polite: true });
+    }
+  });
+
+  // Data Broadcast Handlers
   socket.on('signal', (data) => {
-    if (socket.currentRoom) {
-      socket.to(socket.currentRoom).emit('signal', data);
+    if (currentRoom) {
+      socket.to(currentRoom).emit('signal', data);
     }
   });
-
+  
   socket.on('chat-message', (data) => {
-    if (socket.currentRoom) {
-      socket.to(socket.currentRoom).emit('chat-message', data);
+    if (currentRoom) {
+      socket.to(currentRoom).emit('chat-message', data);
     }
   });
-
+  
   socket.on('file-transfer', (data) => {
-    if (socket.currentRoom) {
-      socket.to(socket.currentRoom).emit('file-transfer', data);
+    if (currentRoom) {
+      socket.to(currentRoom).emit('file-transfer', data);
     }
   });
-
+  
   socket.on('reset_room', () => {
-    if (socket.currentRoom) {
-      io.in(socket.currentRoom).emit('room_reset_kick');
+    if (currentRoom) {
+      io.to(currentRoom).emit('room_reset_kick');
     }
   });
 
+  // Disconnect Handling
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
-    if (socket.currentRoom) {
-      socket.to(socket.currentRoom).emit('user_status', { online: false });
-      socket.to(socket.currentRoom).emit('peer-left');
+    if (currentRoom) {
+      socket.to(currentRoom).emit('user_status', { online: false });
+      socket.to(currentRoom).emit('peer-left');
     }
   });
 });
