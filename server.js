@@ -1,81 +1,94 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*", // Firebase domain se request allow karne ke liye
-    methods: ["GET", "POST"]
-  }
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-app.get("/", (req, res) => {
-  res.send("P2P Backend Server Active!");
+app.get('/', (req, res) => {
+    res.send('PairLink Backend Server is running...');
 });
 
-// Do users ko track karne ke liye array
-let activeUsers = [];
+io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
 
-io.on("connection", (socket) => {
-  console.log("User Connected:", socket.id);
+    // Password validation aur Dynamic Room logic[cite: 7]
+    socket.on('join-room', (password) => {
+        if (!password || typeof password !== 'string') return;
+        const cleanPass = password.trim();
+        if (!cleanPass) return;
 
-  // Agar room me pehle se 2 log hain toh teesre ko block karein
-  if (activeUsers.length >= 2) {
-    socket.emit("room_full");
-    socket.disconnect(true);
-    return;
-  }
+        const roomId = `room_${cleanPass}`;
+        const currentRoom = io.sockets.adapter.rooms.get(roomId);
+        const numClients = currentRoom ? currentRoom.size : 0;
 
-  activeUsers.push(socket.id);
+        // 1. CHANCE: Room nahi hai (0 users) -> Naya Room Banao
+        if (numClients === 0) {
+            socket.join(roomId);
+            socket.roomId = roomId;
+            socket.userPassword = cleanPass;
+            socket.isPolite = false; // Pehla user (Impolite)[cite: 7]
 
-  // Jab 2 users connect ho jayein toh dono ko Online status aur WebRTC role assign karein
-  if (activeUsers.length === 2) {
-    io.emit("user_status", { online: true });
+            socket.emit('room_created', {
+                roomId: roomId,
+                password: cleanPass,
+                isPolite: false
+            });
+            console.log(`Naya room bana pass '${cleanPass}' ke sath: ${socket.id}`);
+        } 
+        // 2. CHANCE: Room pehle se hai aur 1 banda hai -> Join Karo
+        else if (numClients === 1) {
+            socket.join(roomId);
+            socket.roomId = roomId;
+            socket.userPassword = cleanPass;
+            socket.isPolite = true; // Doosra user (Polite)[cite: 7]
 
-    // Polite / Impolite peer assignment (WebRTC collision se bachne ke liye)
-    io.to(activeUsers[0]).emit("peer-ready", { polite: false });
-    io.to(activeUsers[1]).emit("peer-ready", { polite: true });
-  } else {
-    // Sirf 1 user hone par Offline status dikhayenge
-    socket.emit("user_status", { online: false });
-  }
+            socket.emit('room_joined', {
+                roomId: roomId,
+                password: cleanPass,
+                isPolite: true
+            });
 
-  // Room Reset handler (Fix for ghost users & room locking)
-  socket.on("reset_room", () => {
-    activeUsers = [];
-    io.emit("room_reset_kick");
-  });
+            // Dono users ko connection start karne ka signal bhejo
+            io.to(roomId).emit('user_connected', { numClients: 2 });
+            console.log(`User ${socket.id} joined room '${cleanPass}'`);
+        } 
+        // 3. CHANCE: Room full hai (2 log pehle se hain) -> Block Karo[cite: 7]
+        else {
+            socket.emit('room_full', 'Yeh room full ho chuka hai! Kisi aur password se try karein.');
+            console.log(`Room '${cleanPass}' full hai. ${socket.id} reject hua.`);
+        }
+    });
 
-  // 1. WebRTC Signaling relay (Offer, Answer, ICE Candidates)
-  socket.on("signal", (data) => {
-    socket.broadcast.emit("signal", data);
-  });
+    // WebRTC Signaling Data Routing[cite: 7]
+    socket.on('signal', (data) => {
+        if (socket.roomId) {
+            socket.to(socket.roomId).emit('signal', data);
+        }
+    });
 
-  // 2. Chat messaging relay
-  socket.on("chat-message", (msg) => {
-    socket.broadcast.emit("chat-message", msg);
-  });
-
-  // 3. Media / File transfer relay
-  socket.on("file-transfer", (mediaData) => {
-    socket.broadcast.emit("file-transfer", mediaData);
-  });
-
-  // Disconnect hone par cleanup
-  socket.on("disconnect", () => {
-    console.log("User Disconnected:", socket.id);
-    activeUsers = activeUsers.filter((id) => id !== socket.id);
-
-    // Bacha hua user wapas offline status dekhega
-    socket.broadcast.emit("peer-left");
-    socket.broadcast.emit("user_status", { online: false });
-  });
+    // Disconnect Handler: User ke nikalte hi room khali kar do
+    socket.on('disconnect', () => {
+        if (socket.roomId) {
+            // Room me majood doosre user ko disconnect alert bhejo
+            socket.to(socket.roomId).emit('user_disconnected');
+            // Socket ko room se leave karwa do
+            socket.leave(socket.roomId);
+        }
+        console.log('User disconnected:', socket.id);
+    });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
