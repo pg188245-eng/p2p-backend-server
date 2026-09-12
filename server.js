@@ -115,8 +115,14 @@ io.on('connection', (socket) => {
       
       // Socket ko room se bahar nikalo
       socket.leave(currentRoom);
-      socket.to(currentRoom).emit('user_status', { online: false });
-      socket.to(currentRoom).emit('peer-left');
+      const remainingAfterLeave = io.sockets.adapter.rooms.get(currentRoom);
+      // A browser refresh can create the replacement socket before the old
+      // socket finishes leaving. Do not announce offline while two live
+      // sockets are still present in the room.
+      if (!remainingAfterLeave || remainingAfterLeave.size < 2) {
+        socket.to(currentRoom).emit('user_status', { online: false });
+        socket.to(currentRoom).emit('peer-left');
+      }
 
       // Room ke lock (Set) mein se sirf IS user ki ID remove karo
       if (roomsStore[currentRoom] && userId) {
@@ -140,11 +146,14 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     if (currentRoom) {
-      socket.to(currentRoom).emit('user_status', { online: false });
-      socket.to(currentRoom).emit('peer-left');
-
       // Jab dono users disconnect ho jayen (Active Sockets = 0), toh Room Lock Delete kar do
       const room = io.sockets.adapter.rooms.get(currentRoom);
+      // Ignore stale disconnects caused by a refresh when the replacement
+      // socket and its partner are still connected.
+      if (!room || room.size < 2) {
+        socket.to(currentRoom).emit('user_status', { online: false });
+        socket.to(currentRoom).emit('peer-left');
+      }
       if (!room || room.size === 0) {
         delete roomsStore[currentRoom];
         console.log(`Room "${currentRoom}" khali ho gaya. Lock deleted!`);
