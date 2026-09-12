@@ -68,7 +68,7 @@ io.on('connection', (socket) => {
       if (roomsStore[roomName].allowedUsers.size >= 2) {
         // Room me pehle se 2 locked users maujood hain -> Reject 3rd User
         socket.emit('room_locked_error', { 
-          message: 'Yeh room locked hai! Is room ke 2 users fixed hain, koi teesra enter nahi ho sakta.' 
+          message: 'This room is locked for its two registered users. A third user cannot join.' 
         });
         return;
       } else {
