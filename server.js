@@ -9,6 +9,9 @@ app.use(cors());
 const server = http.createServer(app);
 
 const io = new Server(server, {
+  // Chat media is sent as base64 over Socket.IO. Keep this below the
+  // app's 8 MB file limit while allowing normal photos and documents.
+  maxHttpBufferSize: 12 * 1024 * 1024,
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
@@ -21,6 +24,24 @@ app.get('/', (req, res) => {
 
 // Locked Rooms Store: Tracks permanent user IDs allowed in each room
 const roomsStore = {};
+const ROOM_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000;
+
+function expireInactiveRooms() {
+  const now = Date.now();
+  for (const [roomName, roomData] of Object.entries(roomsStore)) {
+    if (now - roomData.lastActivityAt < ROOM_EXPIRY_MS) continue;
+
+    const room = io.sockets.adapter.rooms.get(roomName);
+    if (room) {
+      io.to(roomName).emit('room_expired');
+      io.in(roomName).socketsLeave(roomName);
+    }
+    delete roomsStore[roomName];
+    console.log(`Room "${roomName}" 3 din tak inactive rehne par expire ho gaya.`);
+  }
+}
+
+setInterval(expireInactiveRooms, 60 * 60 * 1000);
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
@@ -33,10 +54,15 @@ io.on('connection', (socket) => {
 
     if (!roomName) return;
 
+    const existingRoom = roomsStore[roomName];
+    if (existingRoom && Date.now() - existingRoom.lastActivityAt >= ROOM_EXPIRY_MS) {
+      delete roomsStore[roomName];
+    }
+
     // 1. Check & Apply Room Lock Logic
     if (!roomsStore[roomName]) {
       // Pehla User: Room create hua
-      roomsStore[roomName] = { allowedUsers: new Set([userId]) };
+      roomsStore[roomName] = { allowedUsers: new Set([userId]), lastActivityAt: Date.now() };
     } else if (!roomsStore[roomName].allowedUsers.has(userId)) {
       // Agar naya user enter karne ki koshish kar raha hai
       if (roomsStore[roomName].allowedUsers.size >= 2) {
@@ -70,6 +96,8 @@ io.on('connection', (socket) => {
     } else {
       socket.emit('user_status', { online: false });
     }
+
+    roomsStore[roomName].lastActivityAt = Date.now();
   }
 
   // Manual Room Join
