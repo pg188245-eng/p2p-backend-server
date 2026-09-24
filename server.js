@@ -25,6 +25,17 @@ app.get('/', (req, res) => {
 const roomsStore = {};
 const ROOM_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000;
 
+function destroyRoom(roomName, notify = true) {
+  if (!roomName) return;
+  const room = io.sockets.adapter.rooms.get(roomName);
+  if (room && notify) io.to(roomName).emit('room_reset_kick');
+  // Delete adapter membership too; deleting only roomsStore leaves stale
+  // sockets that make the next join look like a second peer.
+  if (room) io.in(roomName).socketsLeave(roomName);
+  delete roomsStore[roomName];
+  console.log(`Room "${roomName}" reset and removed.`);
+}
+
 function expireInactiveRooms() {
   const now = Date.now();
   for (const [roomName, roomData] of Object.entries(roomsStore)) {
@@ -135,10 +146,7 @@ io.on('connection', (socket) => {
   
   socket.on('reset_room', () => {
     try {
-      if (currentRoom) {
-        delete roomsStore[currentRoom];
-        io.to(currentRoom).emit('room_reset_kick');
-      }
+      if (currentRoom) destroyRoom(currentRoom, true);
     } catch (err) { console.error("Reset room error:", err); }
   });
 
@@ -180,7 +188,8 @@ io.on('connection', (socket) => {
           socket.to(currentRoom).emit('peer-left');
         }
 
-        if (!room || room.size === 0) {
+        // Socket.IO may still report the disconnecting socket in the room.
+        if (!room || room.size <= 1) {
           delete roomsStore[currentRoom];
           console.log(`Room "${currentRoom}" empty. Lock deleted!`);
         }
