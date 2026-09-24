@@ -47,10 +47,17 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
+  // Helper function to update activity timestamp
+  function touchRoomActivity(roomName) {
+    if (roomsStore[roomName]) {
+      roomsStore[roomName].lastActivityAt = Date.now();
+    }
+  }
+
   // Strict Room Locking & Joining Logic
   function handleJoinRoom(data) {
-    const roomName = typeof data === 'object' ? data.room : data;
-    const userId = (typeof data === 'object' && data.userId) ? data.userId : socket.id;
+    const roomName = (typeof data === 'object' && data !== null) ? data.room : data;
+    const userId = (typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id;
 
     if (!roomName) return;
 
@@ -97,7 +104,7 @@ io.on('connection', (socket) => {
       socket.emit('user_status', { online: false });
     }
 
-    roomsStore[roomName].lastActivityAt = Date.now();
+    touchRoomActivity(roomName);
   }
 
   // Manual Room Join
@@ -113,18 +120,21 @@ io.on('connection', (socket) => {
   // Data Broadcast Handlers
   socket.on('signal', (data) => {
     if (currentRoom) {
+      touchRoomActivity(currentRoom);
       socket.to(currentRoom).emit('signal', data);
     }
   });
   
   socket.on('chat-message', (data) => {
     if (currentRoom) {
+      touchRoomActivity(currentRoom);
       socket.to(currentRoom).emit('chat-message', data);
     }
   });
   
   socket.on('file-transfer', (data) => {
     if (currentRoom) {
+      touchRoomActivity(currentRoom);
       socket.to(currentRoom).emit('file-transfer', data);
     }
   });
@@ -136,17 +146,16 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- NAYA CODE: Manual Leave Room (Taki spot khali ho aur naya room ban sake) ---
+  // --- Manual Leave Room (Taki spot khali ho aur naya room ban sake) ---
   socket.on('leave_room', (data) => {
     if (currentRoom) {
-      const userId = data.userId;
+      const userId = (typeof data === 'object' && data !== null && data.userId) ? data.userId : null;
       
       // Socket ko room se bahar nikalo
       socket.leave(currentRoom);
       const remainingAfterLeave = io.sockets.adapter.rooms.get(currentRoom);
-      // A browser refresh can create the replacement socket before the old
-      // socket finishes leaving. Do not announce offline while two live
-      // sockets are still present in the room.
+
+      // Browser refresh / duplicate socket protection
       if (!remainingAfterLeave || remainingAfterLeave.size < 2) {
         socket.to(currentRoom).emit('user_status', { online: false });
         socket.to(currentRoom).emit('peer-left');
@@ -168,20 +177,18 @@ io.on('connection', (socket) => {
       currentRoom = null;
     }
   });
-  // ----------------------------------------------------------------------------------
 
   // Disconnect Handling & Lock Cleanup
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     if (currentRoom) {
-      // Jab dono users disconnect ho jayen (Active Sockets = 0), toh Room Lock Delete kar do
       const room = io.sockets.adapter.rooms.get(currentRoom);
-      // Ignore stale disconnects caused by a refresh when the replacement
-      // socket and its partner are still connected.
+
       if (!room || room.size < 2) {
         socket.to(currentRoom).emit('user_status', { online: false });
         socket.to(currentRoom).emit('peer-left');
       }
+
       if (!room || room.size === 0) {
         delete roomsStore[currentRoom];
         console.log(`Room "${currentRoom}" khali ho gaya. Lock deleted!`);
