@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const { startRenderPushRelay } = require('./render-push');
 
 const app = express();
 app.use(cors());
@@ -25,6 +26,11 @@ app.get('/', (req, res) => {
 // Google Apps Script Keep-Alive Route (Render ko soone se bachane ke liye)
 app.get('/ping', (req, res) => {
   res.status(200).send('Server is alive!');
+});
+
+// Health endpoint for Render checks and the keep-alive ping.
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ status: 'ok' });
 });
 
 // Locked Rooms Store
@@ -211,6 +217,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const PORT = process.env.PORT || 3000;
+startRenderPushRelay();
 server.listen(PORT, () => {
   console.log(`Server is listening on port ${PORT}`);
 });
