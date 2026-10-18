@@ -17,8 +17,14 @@ const io = new Server(server, {
   }
 });
 
+// Home route
 app.get('/', (req, res) => {
   res.send('PairLink2 Backend is running!');
+});
+
+// Google Apps Script Keep-Alive Route (Render ko soone se bachane ke liye)
+app.get('/ping', (req, res) => {
+  res.status(200).send('Server is alive!');
 });
 
 // Locked Rooms Store
@@ -29,8 +35,6 @@ function destroyRoom(roomName, notify = true) {
   if (!roomName) return;
   const room = io.sockets.adapter.rooms.get(roomName);
   if (room && notify) io.to(roomName).emit('room_reset_kick');
-  // Delete adapter membership too; deleting only roomsStore leaves stale
-  // sockets that make the next join look like a second peer.
   if (room) io.in(roomName).socketsLeave(roomName);
   delete roomsStore[roomName];
   console.log(`Room "${roomName}" reset and removed.`);
@@ -188,7 +192,6 @@ io.on('connection', (socket) => {
           socket.to(currentRoom).emit('peer-left');
         }
 
-        // Socket.IO may still report the disconnecting socket in the room.
         if (!room || room.size <= 1) {
           delete roomsStore[currentRoom];
           console.log(`Room "${currentRoom}" empty. Lock deleted!`);
@@ -198,7 +201,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// GLOBAL CRASH PREVENTER (Isse server kabhi crash nahi hoga)
+// GLOBAL CRASH PREVENTER
 process.on('uncaughtException', (err) => {
   console.error('CRITICAL ERROR PREVENTED:', err);
 });
