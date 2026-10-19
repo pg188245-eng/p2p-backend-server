@@ -14,6 +14,7 @@ const INVALID_TOKEN_CODES = new Set([
 
 let db;
 let messaging;
+const liveCallFallbacks = new Set();
 
 function logPushError(label, error) {
   console.error(`[PairLink push] ${label}:`, error?.message || error);
@@ -90,10 +91,9 @@ async function finishPushDispatch(claim, accepted, consumeOnFailure = false) {
   }
 }
 
-async function receiverIsOnline(userRef) {
-  const snapshot = await userRef.child('devices').get();
+function hasFreshForegroundDevice(devices) {
   const now = Date.now();
-  return Object.values(snapshot.val() || {}).some((device) => {
+  return Object.values(devices || {}).some((device) => {
     // Render treats an app as online only while its screen is actually visible.
     // A background RTDB connection or a stale foreground bit must not suppress a push.
     const visibleAt = Number(device?.visibilityUpdatedAt);
@@ -101,6 +101,11 @@ async function receiverIsOnline(userRef) {
       now - visibleAt <= 30_000 && visibleAt - now <= 30_000;
     return device?.online === true && device?.foreground === true && freshVisibility;
   });
+}
+
+async function receiverIsOnline(userRef) {
+  const snapshot = await userRef.child('devices').get();
+  return hasFreshForegroundDevice(snapshot.val());
 }
 
 async function sendPushToUser(userId, payload, options = {}) {
@@ -250,6 +255,66 @@ async function processInvite(recipientId, snapshot) {
     return;
   }
 
+}
+
+async function processLiveCallInvite(recipientId, snapshot) {
+  const invite = snapshot.val();
+  if (!invite || !['call', 'video'].includes(String(invite.action || ''))) return;
+  try {
+    const isForeground = await receiverIsOnline(db.ref(`users/${recipientId}`));
+    if (isForeground) {
+      watchLiveCallInviteForOfflineFallback(recipientId, snapshot);
+      console.info(`[PairLink push] live call invite belongs to foreground receiver; watching visibility for fallback (callId=${invite.callId || snapshot.key}).`);
+      return;
+    }
+  } catch (error) {
+    logPushError('could not verify live-call receiver presence; falling back to push', error);
+  }
+  return processInvite(recipientId, snapshot);
+}
+
+function watchLiveCallInviteForOfflineFallback(recipientId, snapshot) {
+  const inviteId = String(snapshot.key || '');
+  const watcherKey = `${recipientId}:${inviteId}`;
+  if (!inviteId || liveCallFallbacks.has(watcherKey)) return;
+  liveCallFallbacks.add(watcherKey);
+
+  const inviteRef = db.ref(`users/${recipientId}/liveCallInvites/${inviteId}`);
+  const devicesRef = db.ref(`users/${recipientId}/devices`);
+  let busy = false;
+  let timer = null;
+  const cleanup = () => {
+    devicesRef.off('value', onDevicesChanged);
+    inviteRef.off('value', onInviteChanged);
+    if (timer) clearTimeout(timer);
+    liveCallFallbacks.delete(watcherKey);
+  };
+  const onInviteChanged = (current) => {
+    if (!current.exists()) cleanup();
+  };
+  const onDevicesChanged = (devices) => {
+    if (busy || hasFreshForegroundDevice(devices.val())) return;
+    busy = true;
+    inviteRef.get().then((current) => {
+      cleanup();
+      if (current.exists()) return processInvite(recipientId, current);
+      return undefined;
+    }).catch((error) => {
+      cleanup();
+      logPushError('could not fall back from live invite to offline call push', error);
+    });
+  };
+
+  inviteRef.on('value', onInviteChanged, (error) => {
+    cleanup();
+    logPushError('live call invite fallback listener failed', error);
+  });
+  devicesRef.on('value', onDevicesChanged, (error) => {
+    cleanup();
+    logPushError('live call visibility listener failed', error);
+  });
+  timer = setTimeout(cleanup, 60_000);
+  timer.unref?.();
 }
 
 async function processCallCancellation(recipientId, snapshot) {
@@ -478,6 +543,7 @@ function startRenderPushRelay() {
       watchedUsers.add(userId);
       console.info(`[PairLink push] monitoring call/message inboxes for user ${userId}.`);
       listenForChildAdded(db.ref(`users/${userId}/pairInvites`), `invites ${userId}`, (snapshot) => processInvite(userId, snapshot));
+      listenForChildAdded(db.ref(`users/${userId}/liveCallInvites`), `live call invites ${userId}`, (snapshot) => processLiveCallInvite(userId, snapshot));
       listenForChildAdded(db.ref(`users/${userId}/callCancellations`), `call cancellations ${userId}`, (snapshot) => processCallCancellation(userId, snapshot));
       listenForChildAdded(db.ref(`users/${userId}/pendingMessages`), `pending messages ${userId}`, (snapshot) => processPendingMessage(userId, snapshot));
     });
