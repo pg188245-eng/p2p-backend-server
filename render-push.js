@@ -235,17 +235,11 @@ async function processInvite(recipientId, snapshot) {
           String(roomCall.callerId || '') !== String(invite.from) ||
           String(roomCall.recipientId || '') !== recipientId) return;
 
-      const profile = await getPushProfile(invite.from);
       console.info(`[PairLink push] call wake invite observed (callId=${callId}, recipient=${recipientId}); sending one FCM attempt.`);
       await sendPushToUser(recipientId, {
-        kind: 'incoming_call',
-        callId,
-        inviteId: snapshot.key,
-        roomId: invite.roomId,
-        callerId: invite.from,
-        callerName: profile.name || invite.fromName || 'PairLink user',
-        callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl, invite.fromPhotoDataUrl),
-        video: action === 'video' ? 'true' : 'false'
+        // This is deliberately only a wake signal. The receiver resolves the
+        // active call and caller details directly from Firebase after waking.
+        kind: 'incoming_call_wake'
       }, { ttlMs: 45_000, collapseKey: `call-${callId}`, kind: 'call', eventId: callId, consumeOnAttempt: true });
     } finally {
       // Exactly one wake-up attempt per call. All subsequent call control is
@@ -417,17 +411,9 @@ async function processPendingCall(recipientId, snapshot) {
         String(roomCall.callerId || '') !== String(call.from) ||
         String(roomCall.recipientId || '') !== recipientId) return;
 
-    const profile = await getPushProfile(call.from);
-    const video = call.video === true || call.action === 'video' || call.kind === 'video';
     await sendPushToUser(recipientId, {
-      kind: 'incoming_call',
-      callId: String(call.callId),
-      inviteId: String(call.id || snapshot.key),
-      roomId: String(call.roomId),
-      callerId: String(call.from),
-      callerName: String(call.fromName || profile.name || 'PairLink user'),
-      callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl, call.fromPhotoDataUrl),
-      video: video ? 'true' : 'false'
+      // Call metadata stays in Firebase; Render only wakes the Android client.
+      kind: 'incoming_call_wake'
     }, {
       ttlMs: 45_000,
       collapseKey: `call-${call.callId}`,
