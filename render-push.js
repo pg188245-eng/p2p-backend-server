@@ -1,7 +1,6 @@
 const { createHash, randomUUID } = require('node:crypto');
 const { cert, initializeApp } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
-const { getFirestore } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
 
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL ||
@@ -14,7 +13,6 @@ const INVALID_TOKEN_CODES = new Set([
 ]);
 
 let db;
-let firestore;
 let messaging;
 const liveCallFallbacks = new Set();
 
@@ -213,81 +211,6 @@ async function getPushProfile(userId) {
   return (await db.ref(`users/${userId}/pushProfile`).get()).val() || {};
 }
 
-async function routeCallRequest(input = {}) {
-  if (!db || !firestore || !messaging) throw new Error('Render call router is not initialized');
-
-  const callerId = String(input.callerId || '').trim();
-  const recipientId = String(input.recipientId || '').trim();
-  const roomId = String(input.roomId || '').trim();
-  const callId = String(input.callId || '').trim();
-  if (!callerId || !recipientId || callerId === recipientId || !roomId || !callId ||
-      callerId.length > 180 || recipientId.length > 180 || roomId.length > 200 || callId.length > 180) {
-    const error = new Error('Invalid call-routing request.');
-    error.status = 400;
-    throw error;
-  }
-
-  // Accept a route request only for the permanent Firestore room belonging to
-  // this exact user pair, and only while its Firebase call session is ringing.
-  const participants = [callerId, recipientId].sort();
-  const pairKey = createHash('sha256').update(participants.join('|')).digest('hex');
-  const [pairSnapshot, callSnapshot, activeInviteSnapshot] = await Promise.all([
-    firestore.collection('pairRooms').doc(pairKey).get(),
-    db.ref(`rooms/${roomId}/callSessions/${callId}`).get(),
-    db.ref(`users/${recipientId}/activeCallInvites/${callId}`).get()
-  ]);
-  const pair = pairSnapshot.exists ? pairSnapshot.data() : null;
-  const call = callSnapshot.val();
-  const activeInvite = activeInviteSnapshot.val();
-  const pairMatches = pair && String(pair.roomId || '') === roomId &&
-    (!pair.userA || String(pair.userA) === participants[0]) &&
-    (!pair.userB || String(pair.userB) === participants[1]);
-  const callMatches = call && call.status === 'ringing' &&
-    String(call.callerId || '') === callerId && String(call.recipientId || '') === recipientId;
-  const inviteMatches = activeInvite && String(activeInvite.callId || '') === callId &&
-    String(activeInvite.from || activeInvite.callerId || '') === callerId &&
-    String(activeInvite.to || activeInvite.recipientId || '') === recipientId &&
-    String(activeInvite.roomId || '') === roomId;
-  if (!pairMatches || !callMatches || !inviteMatches) {
-    const error = new Error('Call request did not match its Firebase room and active invite.');
-    error.status = 409;
-    throw error;
-  }
-
-  const inviteId = `call_${callId}`;
-  const action = call.kind === 'video' ? 'video' : 'call';
-  const invite = {
-    id: inviteId,
-    type: 'call',
-    from: callerId,
-    fromName: String(call.callerName || 'PairLink user'),
-    ...(call.callerPhoto ? { fromPhotoDataUrl: String(call.callerPhoto) } : {}),
-    to: recipientId,
-    roomId,
-    action,
-    callId,
-    createdAt: Number(call.createdAt) || Date.now(),
-    sentAt: Date.now(),
-    delivery: 'render-routed'
-  };
-
-  if (await receiverIsOnline(db.ref(`users/${recipientId}`))) {
-    await db.ref(`users/${recipientId}/liveCallInvites/${inviteId}`).set(invite);
-    console.info(`[PairLink push] Render routed live call into Firebase room (callId=${callId}).`);
-    return { route: 'firebase-live', callId };
-  }
-
-  const accepted = await sendPushToUser(recipientId, { kind: 'incoming_call_wake' }, {
-    ttlMs: 45_000,
-    collapseKey: `call-${callId}`,
-    kind: 'call',
-    eventId: callId,
-    consumeOnFailure: true
-  });
-  console.info(`[PairLink push] Render routed offline call wake (callId=${callId}, accepted=${accepted}).`);
-  return { route: accepted > 0 ? 'wake-push' : 'wake-push-unavailable', callId };
-}
-
 async function processInvite(recipientId, snapshot) {
   const invite = snapshot.val();
   if (!invite || invite.pushSentAt || invite.to !== recipientId || !invite.from || !invite.roomId) return;
@@ -478,7 +401,6 @@ async function processPendingCall(recipientId, snapshot) {
   const call = snapshot.val();
   try {
     if (!call || call.pushSentAt || !call.from || call.to !== recipientId || !call.roomId || !call.callId) return;
-    console.info(`[PairLink push] pending call wake row observed (callId=${call.callId}, recipient=${recipientId}); validating and sending one wake push.`);
     const ageMs = Date.now() - Number(call.sentAt || call.createdAt || 0);
     if (!Number.isFinite(ageMs) || ageMs < -60_000 || ageMs > 60_000) return;
 
@@ -497,14 +419,12 @@ async function processPendingCall(recipientId, snapshot) {
       collapseKey: `call-${call.callId}`,
       kind: 'call',
       eventId: String(call.callId),
-      consumeOnAttempt: true,
-      force: true
+      consumeOnAttempt: true
     });
   } catch (error) {
     logPushError('one-shot call wake-up failed', error);
   } finally {
     // One inbox row produces at most one attempt, whether FCM accepts or fails.
-    // Remove it after the attempt so it cannot produce a second ring.
     await snapshot.ref.remove().catch((error) => logPushError('could not remove one-shot call inbox row', error));
   }
 }
@@ -599,7 +519,6 @@ function startRenderPushRelay() {
     }
     const app = initializeApp({ credential: cert(serviceAccount), databaseURL: DATABASE_URL }, 'pairlink-render-push');
     db = getDatabase(app);
-    firestore = getFirestore(app);
     messaging = getMessaging(app);
     const watchedUsers = new Set();
     const watchedRooms = new Set();
@@ -608,7 +527,7 @@ function startRenderPushRelay() {
       const userId = userSnapshot.key;
       if (!userId || watchedUsers.has(userId)) return;
       watchedUsers.add(userId);
-      console.info(`[PairLink push] continuously monitoring pair invites and pending-message inbox (including call wake rows) for user ${userId}.`);
+      console.info(`[PairLink push] monitoring call/message inboxes for user ${userId}.`);
       listenForChildAdded(db.ref(`users/${userId}/pairInvites`), `invites ${userId}`, (snapshot) => processInvite(userId, snapshot));
       listenForChildAdded(db.ref(`users/${userId}/liveCallInvites`), `live call invites ${userId}`, (snapshot) => processLiveCallInvite(userId, snapshot));
       listenForChildAdded(db.ref(`users/${userId}/callCancellations`), `call cancellations ${userId}`, (snapshot) => processCallCancellation(userId, snapshot));
@@ -628,4 +547,4 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, routeCallRequest };
+module.exports = { startRenderPushRelay, recordPushDeliveryReceipt };
