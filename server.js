@@ -138,11 +138,26 @@ io.on('connection', (socket) => {
   
   socket.on('chat-message', (data) => {
     try {
-      if (currentRoom) {
-        touchRoomActivity(currentRoom);
-        socket.to(currentRoom).emit('chat-message', data);
+      const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
+      if (room) {
+        touchRoomActivity(room);
+        socket.to(room).emit('chat-message', data);
       }
     } catch (err) { console.error("Chat message error:", err); }
+  });
+
+  socket.on('chat-delivered', (data) => {
+    try {
+      const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
+      if (room) socket.to(room).emit('chat-delivered', data);
+    } catch (err) { console.error("Chat delivered error:", err); }
+  });
+
+  socket.on('chat-read', (data) => {
+    try {
+      const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
+      if (room) socket.to(room).emit('chat-read', data);
+    } catch (err) { console.error("Chat read error:", err); }
   });
   
   socket.on('file-transfer', (data) => {
