@@ -210,7 +210,22 @@ async function sendPushToUser(userId, payload, options = {}) {
 }
 
 async function getPushProfile(userId) {
-  return (await db.ref(`users/${userId}/pushProfile`).get()).val() || {};
+  try {
+    if (firestore && userId) {
+      const snap = await firestore.collection('users').doc(String(userId)).get();
+      if (snap.exists) {
+        const data = snap.data() || {};
+        return {
+          name: data.name || data.displayName || 'PairLink user',
+          photoDataUrl: data.photoDataUrl || '',
+          notificationAvatar: data.notificationAvatar || ''
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('[PairLink push] Firestore profile lookup fallback:', err?.message || err);
+  }
+  return {};
 }
 
 async function routeCallRequest(input = {}) {
