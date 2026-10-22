@@ -672,36 +672,4 @@ async function recordPushDeliveryReceipt(input = {}) {
   const pendingMatches = pendingMessage?.from === senderId && pendingMessage?.roomId === roomId && pendingMessage?.to === recipientId;
   if (!pendingMatches) return false;
 
-  const receiptRef = db.ref(`users/${senderId}/messageReceipts/${messageId}`);
-  const result = await receiptRef.transaction((current) => {
-    if (current?.status === 'read' || current?.status === 'delivered') return current;
-    return { messageId, roomId, status: 'delivered', updatedAt: Date.now() };
-  });
-  return result.committed;
-}
-
-function listenForChildAdded(ref, label, handler) {
-  ref.on('child_added', (snapshot) => {
-    Promise.resolve(handler(snapshot)).catch((error) => logPushError(`${label} handler failed`, error));
-  }, (error) => logPushError(`${label} listener failed`, error));
-}
-
-async function processPushQueueItem(snapshot) {
-  const item = snapshot.val();
-  if (!item || !item.to || !item.from) {
-    await snapshot.ref.remove().catch(() => {});
-    return;
-  }
-  const recipientId = String(item.to);
-  const eventId = String(item.callId || item.messageId || snapshot.key);
-  const isCall = item.type === 'call' || item.action === 'call' || item.action === 'video';
-
-  try {
-    const profile = item.senderProfile?.notificationAvatar
-      ? item.senderProfile
-      : await getPushProfile(item.from);
-
-    if (isCall) {
-      const isVideo = Boolean(item.video || item.action === 'video');
-      await sendPushToUser(recipientId, {
-        kind:
+  const receiptRef = db.ref(`users/${senderId}/messageReceipts/${
