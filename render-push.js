@@ -806,4 +806,26 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, routeCallRequest };
+async function writeLiveRoomChatMessage(input = {}) {
+  if (!db) throw new Error('Firebase Admin push relay is not initialized');
+  const roomId = String(input.roomId || '').slice(0, 200);
+  const senderId = String(input.senderId || '').slice(0, 180);
+  const recipientId = String(input.recipientId || '').slice(0, 180);
+  const payload = input.envelope;
+  if (!roomId || !senderId || !recipientId || senderId === recipientId || !payload?.id ||
+      String(payload?.encrypted?.sender || '') !== senderId || String(payload?.encrypted?.recipient || '') !== recipientId) {
+    throw new Error('Invalid encrypted room chat message');
+  }
+  const eventRef = db.ref(`rooms/${roomId}/events`).push();
+  await eventRef.set({
+    sender: senderId,
+    recipientId,
+    durableInbox: true,
+    event: 'chat-message',
+    payload,
+    ts: { '.sv': 'timestamp' }
+  });
+  return eventRef.key;
+}
+
+module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, routeCallRequest, writeLiveRoomChatMessage };
