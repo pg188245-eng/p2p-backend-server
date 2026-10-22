@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay, writeLiveRoomChatMessage } = require('./render-push');
+const { startRenderPushRelay } = require('./render-push');
 
 const app = express();
 app.use(cors());
@@ -149,23 +149,67 @@ io.on('connection', (socket) => {
   socket.on('chat-message', (data, acknowledge) => {
     Promise.resolve().then(async () => {
       const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
-      if (!room) {
-        if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'unavailable' });
+      const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
+      if (recipientId) {
+        if (room) touchRoomActivity(room);
+        // Create a one-message Render room. The recipient's current screen or
+        // pair-room membership does not affect delivery; online account-relay
+        // sockets are temporarily added, receive the event, then are removed.
+        const recipientRelayRoom = accountRelayRoom(recipientId);
+        const recipientSocketIds = [...(io.sockets.adapter.rooms.get(recipientRelayRoom) || [])];
+        const recipientSockets = recipientSocketIds
+          .map((socketId) => io.sockets.sockets.get(socketId))
+          .filter(Boolean);
+        if (!recipientSockets.length) {
+          if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'user', reason: 'offline' });
+          return;
+        }
+        const messageId = String(data?.id || data?.encrypted?.id || Date.now());
+        const temporaryRoom = `pairlink-live:${String(room || '')}:${messageId}:${socket.id}`;
+        const joinedRecipientSockets = [];
+        const senderAlreadyJoined = socket.rooms.has(temporaryRoom);
+        try {
+          await socket.join(temporaryRoom);
+          for (const recipientSocket of recipientSockets) {
+            if (!recipientSocket.rooms.has(temporaryRoom)) {
+              await recipientSocket.join(temporaryRoom);
+              joinedRecipientSockets.push(recipientSocket);
+            }
+          }
+          const packet = {
+            id: messageId,
+            roomId: String(room || ''),
+            from: String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || ''),
+            to: recipientId,
+            fromName: String(data?.senderName || 'PairLink user'),
+            sentAt: Number(data?.sentAt) || Date.now(),
+            envelope: data
+          };
+          io.to(temporaryRoom).except(socket.id).timeout(10_000).emit('user-chat-message', packet, (error, responses) => {
+            if (typeof acknowledge === 'function') {
+              acknowledge({
+                routed: !error && (responses || []).some((response) => response?.stored === true),
+                transport: 'render-temporary-room'
+              });
+            }
+            for (const recipientSocket of joinedRecipientSockets) recipientSocket.leave(temporaryRoom);
+            if (!senderAlreadyJoined) socket.leave(temporaryRoom);
+          });
+        } catch (error) {
+          for (const recipientSocket of joinedRecipientSockets) recipientSocket.leave(temporaryRoom);
+          if (!senderAlreadyJoined) socket.leave(temporaryRoom);
+          throw error;
+        }
         return;
       }
-      touchRoomActivity(room);
-      const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
-      if (!recipientId) {
+      if (room) {
+        touchRoomActivity(room);
         socket.to(room).emit('chat-message', data);
         if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'room' });
-        return;
       }
-      const senderId = String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || '');
-      await writeLiveRoomChatMessage({ roomId: room, senderId, recipientId, envelope: data });
-      if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'firebase-room' });
     }).catch((err) => {
       console.error("Chat message error:", err);
-      if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'firebase-room', error: 'write-failed' });
+      if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'render-temporary-room', error: 'delivery-failed' });
     });
   });
 
