@@ -685,6 +685,29 @@ async function recordPushDeliveryReceipt(input = {}) {
   return result.committed;
 }
 
+async function enqueueRenderChatReminder(input = {}) {
+  if (!db) return false;
+  const messageId = String(input.messageId || '').slice(0, 180);
+  const from = String(input.from || '').slice(0, 180);
+  const to = String(input.to || '').slice(0, 180);
+  const roomId = String(input.roomId || '').slice(0, 200);
+  if (!messageId || !from || !to || !roomId || from === to) return false;
+
+  const queueRef = db.ref(`pushQueue/chat-alert_${safeKey(messageId)}`);
+  const result = await queueRef.transaction((current) => current || {
+    id: messageId,
+    messageId,
+    type: 'chat-alert',
+    from,
+    to,
+    fromName: String(input.fromName || 'PairLink user').slice(0, 120),
+    roomId,
+    sentAt: Number(input.sentAt) || Date.now(),
+    createdAt: Date.now()
+  }, undefined, false);
+  return Boolean(result.snapshot?.exists());
+}
+
 function listenForChildAdded(ref, label, handler) {
   ref.on('child_added', (snapshot) => {
     Promise.resolve(handler(snapshot)).catch((error) => logPushError(`${label} handler failed`, error));
@@ -820,4 +843,4 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, routeCallRequest };
+module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, enqueueRenderChatReminder, routeCallRequest };
