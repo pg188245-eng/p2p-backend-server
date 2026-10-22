@@ -628,7 +628,7 @@ async function processPushQueueItem(snapshot) {
         video: isVideo ? 'true' : 'false',
         roomId: item.roomId || '',
         action: isVideo ? 'video' : 'call'
-      }, { ttlMs: 60_000, kind: 'call-wake', eventId });
+      }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
       console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
     } else {
       await sendPushToUser(recipientId, {
@@ -640,7 +640,7 @@ async function processPushQueueItem(snapshot) {
         senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         action: 'sync_chat',
         encrypted: 'true'
-      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId });
+      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
       console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
     }
   } catch (error) {
