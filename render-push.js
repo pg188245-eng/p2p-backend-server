@@ -489,6 +489,15 @@ async function processPendingMessage(recipientId, snapshot) {
   if (message?.type === 'call') return processPendingCall(recipientId, snapshot);
   if (message?.type === 'reaction') return processPendingReaction(recipientId, snapshot);
   if (!message || message.pushSentAt || !message.from || message.to !== recipientId) return;
+  if (message.deliveryMode === 'realtime') {
+    if (await receiverIsOnline(db.ref(`users/${recipientId}`))) return;
+    // The app went offline before consuming its live inbox row. Move the same
+    // encrypted item to pushQueue so the existing worker path can wake it.
+    const queueRef = db.ref(`pushQueue/${snapshot.key}`);
+    await queueRef.transaction((current) => current || { ...message, deliveryMode: null }, undefined, false);
+    await snapshot.ref.remove().catch((error) => logPushError('could not move a live inbox row to pushQueue', error));
+    return;
+  }
   const ageMs = Date.now() - Number(message.sentAt || message.createdAt || 0);
   if (Number.isFinite(ageMs) && ageMs > MAX_PUSH_AGE_MS) return;
   const profile = message.senderProfile?.notificationAvatar
