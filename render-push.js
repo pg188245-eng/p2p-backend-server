@@ -510,6 +510,7 @@ async function processPendingMessage(recipientId, snapshot) {
       messageId,
       senderId: String(message.from),
       senderName: String(message.fromName || profile.name || 'PairLink user'),
+      senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
       alertOnly: 'true'
     }, {
       ttlMs: MAX_PUSH_AGE_MS,
