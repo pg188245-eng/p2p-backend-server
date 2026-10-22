@@ -55,24 +55,6 @@ async function markProcessed(ref) {
   }
 }
 
-async function recordPushAcceptedAsDelivered(message) {
-  if (!message?.from || !message?.roomId || !message?.to || !message?.id) return;
-  try {
-    await db.ref(`users/${message.from}/messageReceipts/${message.id}`).transaction((current) => {
-      if (current?.status === 'read') return current;
-      return {
-        messageId: String(message.id),
-        roomId: String(message.roomId),
-        status: 'delivered',
-        updatedAt: Date.now(),
-        deliverySource: 'push-accepted'
-      };
-    });
-  } catch (error) {
-    logPushError('could not record FCM-accepted delivery receipt', error);
-  }
-}
-
 function getDispatchEventId(payload, options) {
   return String(options.eventId || payload.callId || payload.messageId || payload.reactionId || '');
 }
@@ -571,10 +553,7 @@ async function processPendingMessage(recipientId, snapshot) {
     encrypted: 'true'
   }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId: message.id || snapshot.key });
   if (sent > 0) {
-    await Promise.all([
-      recordPushAcceptedAsDelivered({ ...message, id: String(message.id || snapshot.key) }),
-      markProcessed(snapshot.ref)
-    ]);
+    await markProcessed(snapshot.ref);
   }
 }
 
@@ -654,35 +633,6 @@ async function processRoomEvent(roomId, snapshot) {
     encrypted: 'true'
   }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId: event.payload?.id || snapshot.key });
   if (sent) await markProcessed(snapshot.ref);
-}
-
-async function recordPushDeliveryReceipt(input = {}) {
-  if (!db) throw new Error('Firebase Admin push relay is not initialized');
-  const recipientId = String(input.recipientId || '').slice(0, 180);
-  const senderId = String(input.senderId || '').slice(0, 180);
-  const roomId = String(input.roomId || '').slice(0, 200);
-  const messageId = String(input.messageId || '').slice(0, 180);
-  const deviceToken = String(input.deviceToken || '');
-  if (!recipientId || !senderId || !roomId || !messageId || !deviceToken || deviceToken.length > 4096) return false;
-
-  const recipientRef = db.ref(`users/${recipientId}`);
-  const [tokensSnapshot, pendingSnapshot] = await Promise.all([
-    recipientRef.child('pushTokens').get(),
-    recipientRef.child(`pendingMessages/${messageId}`).get()
-  ]);
-  const tokenIsRegistered = Object.values(tokensSnapshot.val() || {}).some((record) => record?.token === deviceToken);
-  if (!tokenIsRegistered) return false;
-
-  const pendingMessage = pendingSnapshot.val();
-  const pendingMatches = pendingMessage?.from === senderId && pendingMessage?.roomId === roomId && pendingMessage?.to === recipientId;
-  if (!pendingMatches) return false;
-
-  const receiptRef = db.ref(`users/${senderId}/messageReceipts/${messageId}`);
-  const result = await receiptRef.transaction((current) => {
-    if (current?.status === 'read' || current?.status === 'delivered') return current;
-    return { messageId, roomId, status: 'delivered', updatedAt: Date.now() };
-  });
-  return result.committed;
 }
 
 async function enqueueRenderChatReminder(input = {}) {
@@ -791,7 +741,6 @@ async function processPushQueueItem(snapshot) {
         action: 'sync_chat',
         encrypted: 'true'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
-      if (sent > 0) await recordPushAcceptedAsDelivered({ ...item, id: eventId });
       console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
       // Mark as notified in pushQueue, DO NOT delete until recipient opens app and downloads it!
       await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
@@ -849,4 +798,4 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, enqueueRenderChatReminder, routeCallRequest };
+module.exports = { startRenderPushRelay, enqueueRenderChatReminder, routeCallRequest };
