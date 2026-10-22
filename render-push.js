@@ -630,7 +630,9 @@ async function processPushQueueItem(snapshot) {
         action: isVideo ? 'video' : 'call'
       }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
       console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
+      await snapshot.ref.remove().catch(() => {});
     } else {
+      if (item.pushSentAt) return; // Already notified, waiting for receiver to pick up
       await sendPushToUser(recipientId, {
         kind: 'incoming_message',
         roomId: item.roomId || '',
@@ -642,12 +644,11 @@ async function processPushQueueItem(snapshot) {
         encrypted: 'true'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
       console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
+      // Mark as notified in pushQueue, DO NOT delete until recipient opens app and downloads it!
+      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
     }
   } catch (error) {
     logPushError(`pushQueue dispatch failed for ${recipientId}`, error);
-  } finally {
-    // Instantly remove from pushQueue so database remains 100% clean!
-    await snapshot.ref.remove().catch(() => {});
   }
 }
 
