@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay } = require('./render-push');
+const { startRenderPushRelay, enqueueRenderChatReminder } = require('./render-push');
 
 const app = express();
 app.use(cors());
@@ -134,6 +134,28 @@ io.on('connection', (socket) => {
     socket.data.pairlinkUserId = userId;
     socket.join(accountRelayRoom(userId));
     socket.emit('user_relay_joined', { userId });
+  });
+
+  socket.on('queue-chat-reminder', (data, acknowledge) => {
+    Promise.resolve().then(async () => {
+      const recipientId = String(socket.data.pairlinkUserId || '');
+      if (!recipientId || String(data?.to || '') !== recipientId) {
+        if (typeof acknowledge === 'function') acknowledge({ queued: false });
+        return;
+      }
+      const queued = await enqueueRenderChatReminder({
+        messageId: data?.messageId,
+        from: data?.from,
+        to: recipientId,
+        roomId: data?.roomId,
+        fromName: data?.fromName,
+        sentAt: data?.sentAt
+      });
+      if (typeof acknowledge === 'function') acknowledge({ queued });
+    }).catch((error) => {
+      console.error('Chat reminder queue error:', error);
+      if (typeof acknowledge === 'function') acknowledge({ queued: false });
+    });
   });
 
   // --- SAFE BROADCAST HANDLERS (Crash Safe) ---
