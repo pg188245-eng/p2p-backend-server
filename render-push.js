@@ -720,6 +720,19 @@ async function processPushQueueItem(snapshot) {
       }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
       console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
       await snapshot.ref.remove().catch(() => {});
+    } else if (item.type === 'chat-alert') {
+      if (item.pushSentAt) return;
+      await sendPushToUser(recipientId, {
+        kind: 'incoming_message',
+        roomId: String(item.roomId || ''),
+        messageId: String(item.messageId || eventId),
+        senderId: String(item.from),
+        senderName: String(item.fromName || profile.name || 'PairLink user'),
+        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        alertOnly: 'true'
+      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'online-message-alert', eventId, force: true });
+      console.info(`[PairLink push] Render sent a generic chat reminder for recipient ${recipientId} (messageId=${eventId}).`);
+      await snapshot.ref.remove().catch(() => {});
     } else if (item.type === 'deletion') {
       if (item.pushSentAt) return;
       await sendPushToUser(recipientId, {
