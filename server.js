@@ -168,23 +168,23 @@ io.on('connection', (socket) => {
         }
         const recipientRelayRoom = accountRelayRoom(recipientId);
         const recipientSocketIds = io.sockets.adapter.rooms.get(recipientRelayRoom);
-        if (!recipientSocketIds?.size) {
-          if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'unavailable' });
+                if (recipientSocketIds?.size) {
+          io.to(recipientRelayRoom).timeout(10_000).emit('user-chat-message', {
+            id: String(data?.id || ''),
+            roomId: String(room),
+            from: String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || ''),
+            to: recipientId,
+            fromName: String(data?.senderName || 'PairLink user'),
+            sentAt: Number(data?.sentAt) || Date.now(),
+            envelope: data
+          }, (error, responses) => {
+            if (typeof acknowledge === 'function') {
+              acknowledge({ routed: !error && (responses || []).some((response) => response?.stored === true), transport: 'user' });
+            }
+          });
           return;
         }
-        io.to(recipientRelayRoom).timeout(10_000).emit('user-chat-message', {
-          id: String(data?.id || ''),
-          roomId: String(room),
-          from: String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || ''),
-          to: recipientId,
-          fromName: String(data?.senderName || 'PairLink user'),
-          sentAt: Number(data?.sentAt) || Date.now(),
-          envelope: data
-        }, (error, responses) => {
-          if (typeof acknowledge === 'function') {
-            acknowledge({ routed: !error && (responses || []).some((response) => response?.stored === true), transport: 'user' });
-          }
-        });
+        if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'unavailable' });
       }
     } catch (err) { console.error("Chat message error:", err); }
   });
