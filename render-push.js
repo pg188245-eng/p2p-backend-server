@@ -128,6 +128,16 @@ async function receiverIsOnline(userRef) {
   return hasFreshForegroundDevice(snapshot.val());
 }
 
+async function receiverIsInChatRoom(roomId, userId) {
+  if (!roomId || !userId) return false;
+  const snapshot = await db.ref(`rooms/${roomId}/users/${userId}`).get();
+  const presence = snapshot.val();
+  const activeAt = Number(presence?.chatActiveAt);
+  const freshChatPresence = Number.isFinite(activeAt) &&
+    Date.now() - activeAt <= 30_000 && activeAt - Date.now() <= 30_000;
+  return presence?.online === true && presence?.chatActive === true && freshChatPresence;
+}
+
 async function sendPushToUser(userId, payload, options = {}) {
   const userRef = db.ref(`users/${userId}`);
   // A backgrounded app may keep its RTDB socket alive, but the native lock
@@ -489,8 +499,56 @@ async function processPendingMessage(recipientId, snapshot) {
   if (message?.type === 'call') return processPendingCall(recipientId, snapshot);
   if (message?.type === 'reaction') return processPendingReaction(recipientId, snapshot);
   if (!message || message.pushSentAt || !message.from || message.to !== recipientId) return;
+  const ageMs = Date.now() - Number(message.sentAt || message.createdAt || 0);
+  if (Number.isFinite(ageMs) && ageMs > MAX_PUSH_AGE_MS) return;
+  if (message.type === 'chat-alert') {
+    const profile = message.senderProfile?.name ? message.senderProfile : await getPushProfile(message.from);
+    const messageId = String(message.id || message.messageId || snapshot.key);
+    await sendPushToUser(recipientId, {
+      kind: 'incoming_message',
+      roomId: String(message.roomId || ''),
+      messageId,
+      senderId: String(message.from),
+      senderName: String(message.fromName || profile.name || 'PairLink user'),
+      alertOnly: 'true'
+    }, {
+      ttlMs: MAX_PUSH_AGE_MS,
+      kind: 'online-message-alert',
+      eventId: messageId,
+      force: true
+    });
+    await snapshot.ref.remove().catch(() => {});
+    return;
+  }
   if (message.deliveryMode === 'realtime') {
-    if (await receiverIsOnline(db.ref(`users/${recipientId}`))) return;
+    if (await receiverIsOnline(db.ref(`users/${recipientId}`))) {
+      // The encrypted inbox row remains the actual message delivery path. If
+      // the receiver is foreground but not viewing this room, send only a
+      // generic FCM alert identifying the sender; never include message data.
+      if (await receiverIsInChatRoom(message.roomId, recipientId)) return;
+      const profile = message.senderProfile?.name
+        ? message.senderProfile
+        : await getPushProfile(message.from);
+      const messageId = String(message.id || snapshot.key);
+      await sendPushToUser(recipientId, {
+        kind: 'incoming_message',
+        roomId: String(message.roomId || ''),
+        messageId,
+        senderId: String(message.from),
+        senderName: String(message.fromName || profile.name || 'PairLink user'),
+        alertOnly: 'true'
+      }, {
+        ttlMs: MAX_PUSH_AGE_MS,
+        kind: 'online-message-alert',
+        eventId: messageId,
+        force: true
+      });
+      // Do not set pushSentAt here: if the receiver goes offline before the
+      // app consumes this inbox row, Render must still be able to move it to
+      // pushQueue for the normal offline delivery path. Dispatch claims above
+      // deduplicate the alert without changing that inbox state.
+      return;
+    }
     // The app went offline before consuming its live inbox row. Move the same
     // encrypted item to pushQueue so the existing worker path can wake it.
     const queueRef = db.ref(`pushQueue/${snapshot.key}`);
@@ -498,8 +556,6 @@ async function processPendingMessage(recipientId, snapshot) {
     await snapshot.ref.remove().catch((error) => logPushError('could not move a live inbox row to pushQueue', error));
     return;
   }
-  const ageMs = Date.now() - Number(message.sentAt || message.createdAt || 0);
-  if (Number.isFinite(ageMs) && ageMs > MAX_PUSH_AGE_MS) return;
   const profile = message.senderProfile?.notificationAvatar
     ? message.senderProfile
     : await getPushProfile(message.from);
