@@ -111,16 +111,12 @@ async function finishPushDispatch(claim, accepted, consumeOnFailure = false) {
   }
 }
 
+// Render must only ask: is this user online in Firebase right now?
+// Any in-app screen (chat room, call, contacts, notifications, etc.) counts as
+// online. Foreground/visibility flags are no longer used to decide whether to
+// hold a message. Offline handling is unchanged.
 function hasFreshForegroundDevice(devices) {
-  const now = Date.now();
-  return Object.values(devices || {}).some((device) => {
-    // Render treats an app as online only while its screen is actually visible.
-    // A background RTDB connection or a stale foreground bit must not suppress a push.
-    const visibleAt = Number(device?.visibilityUpdatedAt);
-    const freshVisibility = Number.isFinite(visibleAt) &&
-      now - visibleAt <= 30_000 && visibleAt - now <= 30_000;
-    return device?.online === true && device?.foreground === true && freshVisibility;
-  });
+  return Object.values(devices || {}).some((device) => device?.online === true);
 }
 
 async function receiverIsOnline(userRef) {
@@ -128,6 +124,8 @@ async function receiverIsOnline(userRef) {
   return hasFreshForegroundDevice(snapshot.val());
 }
 
+// Chat-room presence is separate from "online". It is used only to decide
+// whether the lightweight "user sent a message" notification should be sent.
 async function receiverIsInChatRoom(roomId, userId) {
   if (!roomId || !userId) return false;
   const snapshot = await db.ref(`rooms/${roomId}/users/${userId}`).get();
@@ -521,10 +519,12 @@ async function processPendingMessage(recipientId, snapshot) {
     return;
   }
   if (message.deliveryMode === 'realtime') {
-    if (await receiverIsOnline(db.ref(`users/${recipientId}`))) {
-      // The encrypted inbox row remains the actual message delivery path. If
-      // the receiver is foreground but not viewing this room, send only a
-      // generic FCM alert identifying the sender; never include message data.
+    const online = await receiverIsOnline(db.ref(`users/${recipientId}`));
+    if (online) {
+      // The user is online in Firebase on some in-app screen. Do not hold the
+      // message; let the live inbox deliver it exactly like a chat-room send.
+      // If they are not currently viewing this chat room, send one lightweight
+      // notification that carries only the sender's name and no message detail.
       if (await receiverIsInChatRoom(message.roomId, recipientId)) return;
       const profile = message.senderProfile?.name
         ? message.senderProfile
@@ -532,25 +532,21 @@ async function processPendingMessage(recipientId, snapshot) {
       const messageId = String(message.id || snapshot.key);
       await sendPushToUser(recipientId, {
         kind: 'incoming_message',
-        roomId: String(message.roomId || ''),
-        messageId,
-        senderId: String(message.from),
         senderName: String(message.fromName || profile.name || 'PairLink user'),
         alertOnly: 'true'
+        // Intentionally no roomId / messageId / senderId here.
       }, {
         ttlMs: MAX_PUSH_AGE_MS,
         kind: 'online-message-alert',
         eventId: messageId,
         force: true
       });
-      // Do not set pushSentAt here: if the receiver goes offline before the
-      // app consumes this inbox row, Render must still be able to move it to
-      // pushQueue for the normal offline delivery path. Dispatch claims above
-      // deduplicate the alert without changing that inbox state.
+      // Do not set pushSentAt or move the row: the live inbox row must remain
+      // the delivery path so the message reaches the user immediately.
       return;
     }
-    // The app went offline before consuming its live inbox row. Move the same
-    // encrypted item to pushQueue so the existing worker path can wake it.
+    // Offline path is unchanged: move the encrypted item to pushQueue so the
+    // existing worker can wake the device.
     const queueRef = db.ref(`pushQueue/${snapshot.key}`);
     await queueRef.transaction((current) => current || { ...message, deliveryMode: null }, undefined, false);
     await snapshot.ref.remove().catch((error) => logPushError('could not move a live inbox row to pushQueue', error));
@@ -708,102 +704,4 @@ async function processPushQueueItem(snapshot) {
     if (isCall) {
       const isVideo = Boolean(item.video || item.action === 'video');
       await sendPushToUser(recipientId, {
-        kind: 'incoming_call',
-        callId: String(item.callId || eventId),
-        callerId: item.from,
-        callerName: item.fromName || profile.name || 'PairLink user',
-        callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
-        video: isVideo ? 'true' : 'false',
-        roomId: item.roomId || '',
-        action: isVideo ? 'video' : 'call'
-      }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
-      console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
-      await snapshot.ref.remove().catch(() => {});
-    } else if (item.type === 'deletion') {
-      if (item.pushSentAt) return;
-      await sendPushToUser(recipientId, {
-        kind: 'incoming_deletion',
-        queueId: String(snapshot.key || eventId),
-        roomId: item.roomId || '',
-        messageId: eventId,
-        deletionKind: item.kind || '',
-        targetMessageId: item.messageId || '',
-        targetMediaId: item.mediaId || '',
-        senderId: item.from,
-        senderName: item.fromName || profile.name || 'PairLink user',
-        action: 'sync_chat'
-      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'deletion-sync', eventId, force: true });
-      console.info(`[PairLink push] Render sent DELETION push for recipient ${recipientId} (id=${eventId}).`);
-      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
-    } else {
-      if (item.pushSentAt) return; // Already notified, waiting for receiver to pick up
-      const sent = await sendPushToUser(recipientId, {
-        kind: 'incoming_message',
-        queueId: String(snapshot.key || eventId),
-        roomId: item.roomId || '',
-        messageId: eventId,
-        senderId: item.from,
-        senderName: item.fromName || profile.name || 'PairLink user',
-        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
-        action: 'sync_chat',
-        encrypted: 'true'
-      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
-      if (sent > 0) await recordPushAcceptedAsDelivered({ ...item, id: eventId });
-      console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
-      // Mark as notified in pushQueue, DO NOT delete until recipient opens app and downloads it!
-      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
-    }
-  } catch (error) {
-    logPushError(`pushQueue dispatch failed for ${recipientId}`, error);
-  }
-}
-
-function startRenderPushRelay() {
-  try {
-    const serviceAccount = readServiceAccount();
-    if (!serviceAccount) {
-      console.warn('[PairLink push] disabled: add FIREBASE_SERVICE_ACCOUNT_JSON to Render environment variables');
-      return false;
-    }
-    if (serviceAccount.project_id !== 'pairlink2') {
-      throw new Error('service-account project_id must be pairlink2');
-    }
-    const app = initializeApp({ credential: cert(serviceAccount), databaseURL: DATABASE_URL }, 'pairlink-render-push');
-    db = getDatabase(app);
-    firestore = getFirestore(app);
-    messaging = getMessaging(app);
-    const watchedUsers = new Set();
-    const watchedRooms = new Set();
-
-    listenForChildAdded(db.ref('users'), 'user index', (userSnapshot) => {
-      const userId = userSnapshot.key;
-      if (!userId || watchedUsers.has(userId)) return;
-      watchedUsers.add(userId);
-      console.info(`[PairLink push] continuously monitoring pair invites and pending-message inbox (including call wake rows) for user ${userId}.`);
-      listenForChildAdded(db.ref(`users/${userId}/pairInvites`), `invites ${userId}`, (snapshot) => processInvite(userId, snapshot));
-      listenForChildAdded(db.ref(`users/${userId}/liveCallInvites`), `live call invites ${userId}`, (snapshot) => processLiveCallInvite(userId, snapshot));
-      listenForChildAdded(db.ref(`users/${userId}/callCancellations`), `call cancellations ${userId}`, (snapshot) => processCallCancellation(userId, snapshot));
-      listenForChildAdded(db.ref(`users/${userId}/pendingMessages`), `pending messages ${userId}`, (snapshot) => processPendingMessage(userId, snapshot));
-    });
-    let pushQueueChain = Promise.resolve();
-    listenForChildAdded(db.ref('pushQueue'), 'pushQueue', (snapshot) => {
-      pushQueueChain = pushQueueChain.then(() => processPushQueueItem(snapshot)).catch((err) => {
-        logPushError('pushQueue serial processing error', err);
-      });
-    });
-
-    listenForChildAdded(db.ref('rooms'), 'room index', (roomSnapshot) => {
-      const roomId = roomSnapshot.key;
-      if (!roomId || watchedRooms.has(roomId)) return;
-      watchedRooms.add(roomId);
-      listenForChildAdded(db.ref(`rooms/${roomId}/events`), `room events ${roomId}`, (snapshot) => processRoomEvent(roomId, snapshot));
-    });
-    console.info('[PairLink push] Render Firebase event relay started.');
-    return true;
-  } catch (error) {
-    logPushError('could not start Firebase event relay', error);
-    return false;
-  }
-}
-
-module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, routeCallRequest };
+        kind:
