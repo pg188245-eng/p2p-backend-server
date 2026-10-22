@@ -36,6 +36,7 @@ app.get('/healthz', (_req, res) => {
 // Locked Rooms Store
 const roomsStore = {};
 const ROOM_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000;
+const accountRelayRoom = (userId) => `pairlink-user:${String(userId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 
 function destroyRoom(roomName, notify = true) {
   if (!roomName) return;
@@ -79,6 +80,7 @@ io.on('connection', (socket) => {
       const userId = (typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id;
 
       if (!roomName) return;
+      socket.data.pairlinkUserId = String(userId);
 
       const existingRoom = roomsStore[roomName];
       if (existingRoom && Date.now() - existingRoom.lastActivityAt >= ROOM_EXPIRY_MS) {
@@ -126,6 +128,14 @@ io.on('connection', (socket) => {
   socket.on('join_room', (data) => handleJoinRoom(data));
   socket.on('rejoin_room', (data) => handleJoinRoom(data));
 
+  socket.on('join_user_relay', (data) => {
+    const userId = String(data?.userId || '');
+    if (!userId) return;
+    socket.data.pairlinkUserId = userId;
+    socket.join(accountRelayRoom(userId));
+    socket.emit('user_relay_joined', { userId });
+  });
+
   // --- SAFE BROADCAST HANDLERS (Crash Safe) ---
   socket.on('signal', (data) => {
     try {
@@ -136,12 +146,45 @@ io.on('connection', (socket) => {
     } catch (err) { console.error("Signal error:", err); }
   });
   
-  socket.on('chat-message', (data) => {
+  socket.on('chat-message', (data, acknowledge) => {
     try {
       const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
       if (room) {
         touchRoomActivity(room);
-        socket.to(room).emit('chat-message', data);
+        const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
+        if (!recipientId) {
+          socket.to(room).emit('chat-message', data);
+          if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'room' });
+          return;
+        }
+        const roomSocketIds = io.sockets.adapter.rooms.get(room) || new Set();
+        const recipientInRoom = [...roomSocketIds].some((socketId) =>
+          socketId !== socket.id && io.sockets.sockets.get(socketId)?.data?.pairlinkUserId === recipientId
+        );
+        if (recipientInRoom) {
+          socket.to(room).emit('chat-message', data);
+          if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'room' });
+          return;
+        }
+        const recipientRelayRoom = accountRelayRoom(recipientId);
+        const recipientSocketIds = io.sockets.adapter.rooms.get(recipientRelayRoom);
+        if (!recipientSocketIds?.size) {
+          if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'unavailable' });
+          return;
+        }
+        io.to(recipientRelayRoom).timeout(10_000).emit('user-chat-message', {
+          id: String(data?.id || ''),
+          roomId: String(room),
+          from: String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || ''),
+          to: recipientId,
+          fromName: String(data?.senderName || 'PairLink user'),
+          sentAt: Number(data?.sentAt) || Date.now(),
+          envelope: data
+        }, (error, responses) => {
+          if (typeof acknowledge === 'function') {
+            acknowledge({ routed: !error && (responses || []).some((response) => response?.stored === true), transport: 'user' });
+          }
+        });
       }
     } catch (err) { console.error("Chat message error:", err); }
   });
