@@ -631,6 +631,21 @@ async function processPushQueueItem(snapshot) {
       }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
       console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
       await snapshot.ref.remove().catch(() => {});
+    } else if (item.type === 'deletion') {
+      if (item.pushSentAt) return;
+      await sendPushToUser(recipientId, {
+        kind: 'incoming_deletion',
+        roomId: item.roomId || '',
+        messageId: eventId,
+        deletionKind: item.kind || '',
+        targetMessageId: item.messageId || '',
+        targetMediaId: item.mediaId || '',
+        senderId: item.from,
+        senderName: item.fromName || profile.name || 'PairLink user',
+        action: 'sync_chat'
+      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'deletion-sync', eventId, force: true });
+      console.info(`[PairLink push] Render sent DELETION push for recipient ${recipientId} (id=${eventId}).`);
+      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
     } else {
       if (item.pushSentAt) return; // Already notified, waiting for receiver to pick up
       await sendPushToUser(recipientId, {
@@ -679,8 +694,11 @@ function startRenderPushRelay() {
       listenForChildAdded(db.ref(`users/${userId}/callCancellations`), `call cancellations ${userId}`, (snapshot) => processCallCancellation(userId, snapshot));
       listenForChildAdded(db.ref(`users/${userId}/pendingMessages`), `pending messages ${userId}`, (snapshot) => processPendingMessage(userId, snapshot));
     });
+    let pushQueueChain = Promise.resolve();
     listenForChildAdded(db.ref('pushQueue'), 'pushQueue', (snapshot) => {
-      processPushQueueItem(snapshot);
+      pushQueueChain = pushQueueChain.then(() => processPushQueueItem(snapshot)).catch((err) => {
+        logPushError('pushQueue serial processing error', err);
+      });
     });
 
     listenForChildAdded(db.ref('rooms'), 'room index', (roomSnapshot) => {
