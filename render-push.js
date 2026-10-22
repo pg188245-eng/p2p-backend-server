@@ -55,6 +55,24 @@ async function markProcessed(ref) {
   }
 }
 
+async function recordPushAcceptedAsDelivered(message) {
+  if (!message?.from || !message?.roomId || !message?.to || !message?.id) return;
+  try {
+    await db.ref(`users/${message.from}/messageReceipts/${message.id}`).transaction((current) => {
+      if (current?.status === 'read') return current;
+      return {
+        messageId: String(message.id),
+        roomId: String(message.roomId),
+        status: 'delivered',
+        updatedAt: Date.now(),
+        deliverySource: 'push-accepted'
+      };
+    });
+  } catch (error) {
+    logPushError('could not record FCM-accepted delivery receipt', error);
+  }
+}
+
 function getDispatchEventId(payload, options) {
   return String(options.eventId || payload.callId || payload.messageId || payload.reactionId || '');
 }
@@ -486,7 +504,12 @@ async function processPendingMessage(recipientId, snapshot) {
       action: 'sync_chat',
     encrypted: 'true'
   }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId: message.id || snapshot.key });
-  if (sent) await markProcessed(snapshot.ref);
+  if (sent > 0) {
+    await Promise.all([
+      recordPushAcceptedAsDelivered({ ...message, id: String(message.id || snapshot.key) }),
+      markProcessed(snapshot.ref)
+    ]);
+  }
 }
 
 async function processPendingCall(recipientId, snapshot) {
@@ -648,7 +671,7 @@ async function processPushQueueItem(snapshot) {
       await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
     } else {
       if (item.pushSentAt) return; // Already notified, waiting for receiver to pick up
-      await sendPushToUser(recipientId, {
+      const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
         roomId: item.roomId || '',
         messageId: eventId,
@@ -658,6 +681,7 @@ async function processPushQueueItem(snapshot) {
         action: 'sync_chat',
         encrypted: 'true'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
+      if (sent > 0) await recordPushAcceptedAsDelivered({ ...item, id: eventId });
       console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
       // Mark as notified in pushQueue, DO NOT delete until recipient opens app and downloads it!
       await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
