@@ -658,6 +658,7 @@ async function processPushQueueItem(snapshot) {
       if (item.pushSentAt) return;
       await sendPushToUser(recipientId, {
         kind: 'incoming_deletion',
+        queueId: String(snapshot.key || eventId),
         roomId: item.roomId || '',
         messageId: eventId,
         deletionKind: item.kind || '',
@@ -673,6 +674,7 @@ async function processPushQueueItem(snapshot) {
       if (item.pushSentAt) return; // Already notified, waiting for receiver to pick up
       const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
+        queueId: String(snapshot.key || eventId),
         roomId: item.roomId || '',
         messageId: eventId,
         senderId: item.from,
