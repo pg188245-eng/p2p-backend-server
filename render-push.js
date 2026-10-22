@@ -745,7 +745,7 @@ async function processPushQueueItem(snapshot) {
       await snapshot.ref.remove().catch(() => {});
     } else if (item.type === 'chat-alert') {
       if (item.pushSentAt) return;
-      await sendPushToUser(recipientId, {
+      const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
         roomId: String(item.roomId || ''),
         messageId: String(item.messageId || eventId),
@@ -755,7 +755,13 @@ async function processPushQueueItem(snapshot) {
         alertOnly: 'true'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'online-message-alert', eventId, force: true });
       console.info(`[PairLink push] Render sent a generic chat reminder for recipient ${recipientId} (messageId=${eventId}).`);
-      await snapshot.ref.remove().catch(() => {});
+      if (sent > 0) {
+        await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
+        const cleanupTimer = setTimeout(() => snapshot.ref.remove().catch(() => {}), 60_000);
+        cleanupTimer.unref?.();
+      } else {
+        await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
+      }
     } else if (item.type === 'deletion') {
       if (item.pushSentAt) return;
       await sendPushToUser(recipientId, {
