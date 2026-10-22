@@ -111,10 +111,9 @@ async function finishPushDispatch(claim, accepted, consumeOnFailure = false) {
   }
 }
 
-// Render must only ask: is this user online in Firebase right now?
-// Any in-app screen (chat room, call, contacts, notifications, etc.) counts as
-// online. Foreground/visibility flags are no longer used to decide whether to
-// hold a message. Offline handling is unchanged.
+// Render only checks whether the user is online in Firebase on any in-app
+// screen (chat, call, contacts, notifications). Foreground/visibility flags
+// no longer decide whether a message is held.
 function hasFreshForegroundDevice(devices) {
   return Object.values(devices || {}).some((device) => device?.online === true);
 }
@@ -124,8 +123,6 @@ async function receiverIsOnline(userRef) {
   return hasFreshForegroundDevice(snapshot.val());
 }
 
-// Chat-room presence is separate from "online". It is used only to decide
-// whether the lightweight "user sent a message" notification should be sent.
 async function receiverIsInChatRoom(roomId, userId) {
   if (!roomId || !userId) return false;
   const snapshot = await db.ref(`rooms/${roomId}/users/${userId}`).get();
@@ -138,15 +135,10 @@ async function receiverIsInChatRoom(roomId, userId) {
 
 async function sendPushToUser(userId, payload, options = {}) {
   const userRef = db.ref(`users/${userId}`);
-  // A backgrounded app may keep its RTDB socket alive, but the native lock
-  // screen owns call presentation there. Only an actually foreground app can
-  // consume a call invite live without a push notification.
   const [tokensSnapshot, online] = await Promise.all([
     userRef.child('pushTokens').get(),
     options.force ? Promise.resolve(false) : receiverIsOnline(userRef)
   ]);
-  // Realtime Database is the live path for foreground devices. For incoming
-  // calls, a background connection cannot present the native lock-screen UI.
   if (online && !options.force) {
     console.info(`[PairLink push] receiver online; skipped (${options.kind || 'notification'})`);
     return 0;
@@ -155,7 +147,6 @@ async function sendPushToUser(userId, payload, options = {}) {
   const uniqueTokens = new Map();
   Object.entries(tokenRecords).filter(([, record]) => {
     if (typeof record?.token !== 'string' || !record.token) return false;
-    // For calls, an online but backgrounded device also needs the native alert.
     return !options.platform || record.platform === options.platform;
   }).forEach(([key, record]) => {
     if (!uniqueTokens.has(record.token)) uniqueTokens.set(record.token, [key, record]);
@@ -178,8 +169,6 @@ async function sendPushToUser(userId, payload, options = {}) {
     return 0;
   }
 
-  // Recheck immediately before FCM dispatch so a device that just returned to
-  // the foreground can handle the call live without a competing push card.
   try {
     if (!options.force && await receiverIsOnline(userRef)) {
       await finishPushDispatch(claim, false, Boolean(options.consumeOnAttempt));
@@ -194,7 +183,6 @@ async function sendPushToUser(userId, payload, options = {}) {
 
   let sent = 0;
   const invalidTokenUpdates = {};
-  // FCM multicast accepts at most 500 registration tokens per request.
   try {
     for (let start = 0; start < entries.length; start += 500) {
       const batch = entries.slice(start, start + 500);
@@ -268,8 +256,6 @@ async function routeCallRequest(input = {}) {
     throw error;
   }
 
-  // Accept a route request only for the permanent Firestore room belonging to
-  // this exact user pair, and only while its Firebase call session is ringing.
   const participants = [callerId, recipientId].sort();
   const pairKey = createHash('sha256').update(participants.join('|')).digest('hex');
   const [pairSnapshot, callSnapshot, activeInviteSnapshot] = await Promise.all([
@@ -340,8 +326,6 @@ async function processInvite(recipientId, snapshot) {
     try {
       if (ageMs > 60_000) return;
       const callId = String(invite.callId || snapshot.key);
-      // The Firebase room session is authoritative. The invite exists only to
-      // request one Render wake-up push for a non-visible receiver.
       const [cancellationSnapshots, roomCallSnapshot] = await Promise.all([
         Promise.all([recipientId, invite.from].map((userId) =>
           db.ref(`users/${userId}/callCancellations/${callId}`).get().catch(() => null))),
@@ -355,13 +339,9 @@ async function processInvite(recipientId, snapshot) {
 
       console.info(`[PairLink push] call wake invite observed (callId=${callId}, recipient=${recipientId}); sending one FCM attempt.`);
       await sendPushToUser(recipientId, {
-        // This is deliberately only a wake signal. The receiver resolves the
-        // active call and caller details directly from Firebase after waking.
         kind: 'incoming_call_wake'
       }, { ttlMs: 45_000, collapseKey: `call-${callId}`, kind: 'call', eventId: callId, consumeOnAttempt: true });
     } finally {
-      // Exactly one wake-up attempt per call. All subsequent call control is
-      // room-local Firebase signaling, never a second Render invite.
       await snapshot.ref.remove().catch((error) => logPushError('could not remove one-shot call invite', error));
     }
     return;
@@ -453,9 +433,6 @@ async function processCallCancellation(recipientId, snapshot) {
       return Boolean(state?.acceptedAt || state?.status === 'accepted');
     });
   }
-  // Room session state already ends/rejects the live call on both devices.
-  // Render must not send a second call-ended push. It only relays a true
-  // missed-call timeout, which Firebase has explicitly marked as "missed".
   let missedPushSent = 1;
   if (isRecipientTerminal && callerId && terminalStatus === 'missed' && !wasAccepted) {
     const callerProfile = await getPushProfile(callerId);
@@ -483,9 +460,6 @@ async function processCallCancellation(recipientId, snapshot) {
     ];
     await Promise.all(completedDispatches.map((ref) => ref.remove().catch((error) =>
       logPushError('could not remove completed call push record', error))));
-    // Keep the terminal marker available to live clients for a short grace
-    // period. FCM acceptance is not proof that an active WebView consumed the
-    // event, and immediate deletion can race its RTDB listener.
     await snapshot.ref.update({ pushSentAt: Date.now() });
     setTimeout(() => snapshot.ref.remove().catch((error) =>
       logPushError('could not expire completed call cancellation', error)), 60_000);
@@ -522,9 +496,9 @@ async function processPendingMessage(recipientId, snapshot) {
     const online = await receiverIsOnline(db.ref(`users/${recipientId}`));
     if (online) {
       // The user is online in Firebase on some in-app screen. Do not hold the
-      // message; let the live inbox deliver it exactly like a chat-room send.
-      // If they are not currently viewing this chat room, send one lightweight
-      // notification that carries only the sender's name and no message detail.
+      // message: let the live inbox deliver it exactly like a chat-room send.
+      // If they are not viewing this chat room, send one lightweight alert
+      // with only the sender's name and no message detail.
       if (await receiverIsInChatRoom(message.roomId, recipientId)) return;
       const profile = message.senderProfile?.name
         ? message.senderProfile
@@ -534,19 +508,15 @@ async function processPendingMessage(recipientId, snapshot) {
         kind: 'incoming_message',
         senderName: String(message.fromName || profile.name || 'PairLink user'),
         alertOnly: 'true'
-        // Intentionally no roomId / messageId / senderId here.
       }, {
         ttlMs: MAX_PUSH_AGE_MS,
         kind: 'online-message-alert',
         eventId: messageId,
         force: true
       });
-      // Do not set pushSentAt or move the row: the live inbox row must remain
-      // the delivery path so the message reaches the user immediately.
       return;
     }
-    // Offline path is unchanged: move the encrypted item to pushQueue so the
-    // existing worker can wake the device.
+    // Offline path is unchanged.
     const queueRef = db.ref(`pushQueue/${snapshot.key}`);
     await queueRef.transaction((current) => current || { ...message, deliveryMode: null }, undefined, false);
     await snapshot.ref.remove().catch((error) => logPushError('could not move a live inbox row to pushQueue', error));
@@ -581,15 +551,12 @@ async function processPendingCall(recipientId, snapshot) {
     const ageMs = Date.now() - Number(call.sentAt || call.createdAt || 0);
     if (!Number.isFinite(ageMs) || ageMs < -60_000 || ageMs > 60_000) return;
 
-    // A pending inbox entry only asks Render to wake the receiver. Firebase's
-    // shared room call session remains authoritative for whether it is ringing.
     const roomCall = (await db.ref(`rooms/${call.roomId}/callSessions/${call.callId}`).get()).val();
     if (!roomCall || roomCall.status !== 'ringing' ||
         String(roomCall.callerId || '') !== String(call.from) ||
         String(roomCall.recipientId || '') !== recipientId) return;
 
     await sendPushToUser(recipientId, {
-      // Call metadata stays in Firebase; Render only wakes the Android client.
       kind: 'incoming_call_wake'
     }, {
       ttlMs: 45_000,
@@ -602,12 +569,9 @@ async function processPendingCall(recipientId, snapshot) {
   } catch (error) {
     logPushError('one-shot call wake-up failed', error);
   } finally {
-    // One inbox row produces at most one attempt, whether FCM accepts or fails.
-    // Remove it after the attempt so it cannot produce a second ring.
     await snapshot.ref.remove().catch((error) => logPushError('could not remove one-shot call inbox row', error));
   }
 }
-
 async function processPendingReaction(recipientId, snapshot) {
   const reaction = snapshot.val();
   if (!reaction || reaction.pushSentAt || reaction.to !== recipientId || !reaction.from || !reaction.roomId || !reaction.emoji) return;
@@ -630,8 +594,6 @@ async function processPendingReaction(recipientId, snapshot) {
 async function processRoomEvent(roomId, snapshot) {
   const event = snapshot.val();
   if (!event || event.event !== 'chat-message' || !event.sender || event.pushSentAt) return;
-  // New clients persist an encrypted pendingMessages copy alongside the room
-  // event. That inbox listener sends the single push for this message.
   if (event.durableInbox === true) return;
   const ageMs = Date.now() - Number(event.ts || 0);
   if (!Number.isFinite(ageMs) || ageMs < -60_000 || ageMs > MAX_PUSH_AGE_MS) return;
@@ -672,4 +634,133 @@ async function recordPushDeliveryReceipt(input = {}) {
   const pendingMatches = pendingMessage?.from === senderId && pendingMessage?.roomId === roomId && pendingMessage?.to === recipientId;
   if (!pendingMatches) return false;
 
-  const receiptRef = db.ref(`users/${senderId}/messageReceipts/${
+  const receiptRef = db.ref(`users/${senderId}/messageReceipts/${messageId}`);
+  const result = await receiptRef.transaction((current) => {
+    if (current?.status === 'read' || current?.status === 'delivered') return current;
+    return { messageId, roomId, status: 'delivered', updatedAt: Date.now() };
+  });
+  return result.committed;
+}
+
+function listenForChildAdded(ref, label, handler) {
+  ref.on('child_added', (snapshot) => {
+    Promise.resolve(handler(snapshot)).catch((error) => logPushError(`${label} handler failed`, error));
+  }, (error) => logPushError(`${label} listener failed`, error));
+}
+
+async function processPushQueueItem(snapshot) {
+  const item = snapshot.val();
+  if (!item || !item.to || !item.from) {
+    await snapshot.ref.remove().catch(() => {});
+    return;
+  }
+  const recipientId = String(item.to);
+  const eventId = String(item.callId || item.messageId || snapshot.key);
+  const isCall = item.type === 'call' || item.action === 'call' || item.action === 'video';
+
+  try {
+    const profile = item.senderProfile?.notificationAvatar
+      ? item.senderProfile
+      : await getPushProfile(item.from);
+
+    if (isCall) {
+      const isVideo = Boolean(item.video || item.action === 'video');
+      await sendPushToUser(recipientId, {
+        kind: 'incoming_call',
+        callId: String(item.callId || eventId),
+        callerId: item.from,
+        callerName: item.fromName || profile.name || 'PairLink user',
+        callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        video: isVideo ? 'true' : 'false',
+        roomId: item.roomId || '',
+        action: isVideo ? 'video' : 'call'
+      }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
+      console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
+      await snapshot.ref.remove().catch(() => {});
+    } else if (item.type === 'deletion') {
+      if (item.pushSentAt) return;
+      await sendPushToUser(recipientId, {
+        kind: 'incoming_deletion',
+        queueId: String(snapshot.key || eventId),
+        roomId: item.roomId || '',
+        messageId: eventId,
+        deletionKind: item.kind || '',
+        targetMessageId: item.messageId || '',
+        targetMediaId: item.mediaId || '',
+        senderId: item.from,
+        senderName: item.fromName || profile.name || 'PairLink user',
+        action: 'sync_chat'
+      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'deletion-sync', eventId, force: true });
+      console.info(`[PairLink push] Render sent DELETION push for recipient ${recipientId} (id=${eventId}).`);
+      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
+    } else {
+      if (item.pushSentAt) return;
+      const sent = await sendPushToUser(recipientId, {
+        kind: 'incoming_message',
+        queueId: String(snapshot.key || eventId),
+        roomId: item.roomId || '',
+        messageId: eventId,
+        senderId: item.from,
+        senderName: item.fromName || profile.name || 'PairLink user',
+        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        action: 'sync_chat',
+        encrypted: 'true'
+      }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
+      if (sent > 0) await recordPushAcceptedAsDelivered({ ...item, id: eventId });
+      console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
+      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
+    }
+  } catch (error) {
+    logPushError(`pushQueue dispatch failed for ${recipientId}`, error);
+  }
+}
+
+function startRenderPushRelay() {
+  try {
+    const serviceAccount = readServiceAccount();
+    if (!serviceAccount) {
+      console.warn('[PairLink push] disabled: add FIREBASE_SERVICE_ACCOUNT_JSON to Render environment variables');
+      return false;
+    }
+    if (serviceAccount.project_id !== 'pairlink2') {
+      throw new Error('service-account project_id must be pairlink2');
+    }
+    const app = initializeApp({ credential: cert(serviceAccount), databaseURL: DATABASE_URL }, 'pairlink-render-push');
+    db = getDatabase(app);
+    firestore = getFirestore(app);
+    messaging = getMessaging(app);
+    const watchedUsers = new Set();
+    const watchedRooms = new Set();
+
+    listenForChildAdded(db.ref('users'), 'user index', (userSnapshot) => {
+      const userId = userSnapshot.key;
+      if (!userId || watchedUsers.has(userId)) return;
+      watchedUsers.add(userId);
+      console.info(`[PairLink push] continuously monitoring pair invites and pending-message inbox (including call wake rows) for user ${userId}.`);
+      listenForChildAdded(db.ref(`users/${userId}/pairInvites`), `invites ${userId}`, (snapshot) => processInvite(userId, snapshot));
+      listenForChildAdded(db.ref(`users/${userId}/liveCallInvites`), `live call invites ${userId}`, (snapshot) => processLiveCallInvite(userId, snapshot));
+      listenForChildAdded(db.ref(`users/${userId}/callCancellations`), `call cancellations ${userId}`, (snapshot) => processCallCancellation(userId, snapshot));
+      listenForChildAdded(db.ref(`users/${userId}/pendingMessages`), `pending messages ${userId}`, (snapshot) => processPendingMessage(userId, snapshot));
+    });
+    let pushQueueChain = Promise.resolve();
+    listenForChildAdded(db.ref('pushQueue'), 'pushQueue', (snapshot) => {
+      pushQueueChain = pushQueueChain.then(() => processPushQueueItem(snapshot)).catch((err) => {
+        logPushError('pushQueue serial processing error', err);
+      });
+    });
+
+    listenForChildAdded(db.ref('rooms'), 'room index', (roomSnapshot) => {
+      const roomId = roomSnapshot.key;
+      if (!roomId || watchedRooms.has(roomId)) return;
+      watchedRooms.add(roomId);
+      listenForChildAdded(db.ref(`rooms/${roomId}/events`), `room events ${roomId}`, (snapshot) => processRoomEvent(roomId, snapshot));
+    });
+    console.info('[PairLink push] Render Firebase event relay started.');
+    return true;
+  } catch (error) {
+    logPushError('could not start Firebase event relay', error);
+    return false;
+  }
+}
+
+module.exports = { startRenderPushRelay, recordPushDeliveryReceipt, routeCallRequest };
