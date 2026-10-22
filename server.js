@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay } = require('./render-push');
+const { startRenderPushRelay, writeLiveRoomChatMessage } = require('./render-push');
 
 const app = express();
 app.use(cors());
@@ -147,46 +147,26 @@ io.on('connection', (socket) => {
   });
   
   socket.on('chat-message', (data, acknowledge) => {
-    try {
+    Promise.resolve().then(async () => {
       const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
-      if (room) {
-        touchRoomActivity(room);
-        const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
-        if (!recipientId) {
-          socket.to(room).emit('chat-message', data);
-          if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'room' });
-          return;
-        }
-        const roomSocketIds = io.sockets.adapter.rooms.get(room) || new Set();
-        const recipientInRoom = [...roomSocketIds].some((socketId) =>
-          socketId !== socket.id && io.sockets.sockets.get(socketId)?.data?.pairlinkUserId === recipientId
-        );
-        if (recipientInRoom) {
-          socket.to(room).emit('chat-message', data);
-          if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'room' });
-          return;
-        }
-        const recipientRelayRoom = accountRelayRoom(recipientId);
-        const recipientSocketIds = io.sockets.adapter.rooms.get(recipientRelayRoom);
-                if (recipientSocketIds?.size) {
-          io.to(recipientRelayRoom).timeout(10_000).emit('user-chat-message', {
-            id: String(data?.id || ''),
-            roomId: String(room),
-            from: String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || ''),
-            to: recipientId,
-            fromName: String(data?.senderName || 'PairLink user'),
-            sentAt: Number(data?.sentAt) || Date.now(),
-            envelope: data
-          }, (error, responses) => {
-            if (typeof acknowledge === 'function') {
-              acknowledge({ routed: !error && (responses || []).some((response) => response?.stored === true), transport: 'user' });
-            }
-          });
-          return;
-        }
+      if (!room) {
         if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'unavailable' });
+        return;
       }
-    } catch (err) { console.error("Chat message error:", err); }
+      touchRoomActivity(room);
+      const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
+      if (!recipientId) {
+        socket.to(room).emit('chat-message', data);
+        if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'room' });
+        return;
+      }
+      const senderId = String(socket.data.pairlinkUserId || data?.senderId || data?.encrypted?.sender || '');
+      await writeLiveRoomChatMessage({ roomId: room, senderId, recipientId, envelope: data });
+      if (typeof acknowledge === 'function') acknowledge({ routed: true, transport: 'firebase-room' });
+    }).catch((err) => {
+      console.error("Chat message error:", err);
+      if (typeof acknowledge === 'function') acknowledge({ routed: false, transport: 'firebase-room', error: 'write-failed' });
+    });
   });
 
   socket.on('chat-delivered', (data) => {
