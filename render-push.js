@@ -1,4 +1,5 @@
-const { createHash, randomUUID } = require('node:crypto');
+const crypto = require('node:crypto');
+const { createHash, randomUUID } = crypto;
 const { cert, initializeApp } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
 const { getFirestore } = require('firebase-admin/firestore');
@@ -17,6 +18,99 @@ let db;
 let firestore;
 let messaging;
 const liveCallFallbacks = new Set();
+
+function base64UrlDecode(value) {
+  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(normalized + '='.repeat((4 - normalized.length % 4) % 4), 'base64');
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function hkdfExtract(salt, input) {
+  return crypto.createHmac('sha256', salt).update(input).digest();
+}
+
+function hkdfExpand(prk, info, length) {
+  const chunks = [];
+  let previous = Buffer.alloc(0);
+  for (let counter = 1, size = 0; size < length; counter++) {
+    previous = crypto.createHmac('sha256', prk).update(previous).update(info).update(Buffer.from([counter])).digest();
+    chunks.push(previous);
+    size += previous.length;
+  }
+  return Buffer.concat(chunks).subarray(0, length);
+}
+
+function webPushKeys() {
+  const privateValue = String(process.env.WEB_PUSH_VAPID_PRIVATE_KEY || '').trim();
+  const publicValue = String(process.env.WEB_PUSH_VAPID_PUBLIC_KEY || '').trim();
+  if (!privateValue || !publicValue) return null;
+  const publicBytes = base64UrlDecode(publicValue);
+  if (publicBytes.length !== 65 || publicBytes[0] !== 4) throw new Error('WEB_PUSH_VAPID_PUBLIC_KEY must be a P-256 uncompressed public key.');
+  return {
+    publicValue,
+    privateValue: base64UrlDecode(privateValue),
+    x: base64UrlEncode(publicBytes.subarray(1, 33)),
+    y: base64UrlEncode(publicBytes.subarray(33, 65))
+  };
+}
+
+function webPushEncrypt(subscription, payload) {
+  const receiverKeyBytes = base64UrlDecode(subscription.keys?.p256dh);
+  const authSecret = base64UrlDecode(subscription.keys?.auth);
+  if (receiverKeyBytes.length !== 65 || receiverKeyBytes[0] !== 4 || authSecret.length < 16) throw new Error('Invalid Web Push subscription keys.');
+  const receiverKey = crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: base64UrlEncode(receiverKeyBytes.subarray(1, 33)), y: base64UrlEncode(receiverKeyBytes.subarray(33, 65)) }, format: 'jwk' });
+  const sender = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const senderJwk = sender.publicKey.export({ format: 'jwk' });
+  const senderPublic = Buffer.concat([Buffer.from([4]), base64UrlDecode(senderJwk.x), base64UrlDecode(senderJwk.y)]);
+  const shared = crypto.diffieHellman({ privateKey: sender.privateKey, publicKey: receiverKey });
+  const keyInfo = Buffer.concat([Buffer.from('WebPush: info\0'), receiverKeyBytes, senderPublic]);
+  const prkKey = hkdfExtract(authSecret, shared);
+  const ikm = hkdfExpand(prkKey, keyInfo, 32);
+  const salt = crypto.randomBytes(16);
+  const prk = hkdfExtract(salt, ikm);
+  const cek = hkdfExpand(prk, Buffer.from('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = hkdfExpand(prk, Buffer.from('Content-Encoding: nonce\0'), 12);
+  const cipher = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+  const encrypted = Buffer.concat([cipher.update(Buffer.concat([Buffer.from(JSON.stringify(payload)), Buffer.from([2])])), cipher.final(), cipher.getAuthTag()]);
+  const header = Buffer.alloc(21);
+  salt.copy(header, 0);
+  header.writeUInt32BE(4096, 16);
+  header[20] = senderPublic.length;
+  return Buffer.concat([header, senderPublic, encrypted]);
+}
+
+function webPushVapidAuthorization(endpoint, keys) {
+  const audience = new URL(endpoint).origin;
+  const header = base64UrlEncode(JSON.stringify({ typ: 'JWT', alg: 'ES256' }));
+  const claims = base64UrlEncode(JSON.stringify({ aud: audience, exp: Math.floor(Date.now() / 1000) + 12 * 60 * 60, sub: process.env.WEB_PUSH_VAPID_SUBJECT || 'mailto:support@pairlink2.web.app' }));
+  const unsigned = `${header}.${claims}`;
+  const privateKey = crypto.createPrivateKey({ key: { kty: 'EC', crv: 'P-256', x: keys.x, y: keys.y, d: base64UrlEncode(keys.privateValue) }, format: 'jwk' });
+  const signature = crypto.sign('sha256', Buffer.from(unsigned), { key: privateKey, dsaEncoding: 'ieee-p1363' });
+  return `vapid t=${unsigned}.${base64UrlEncode(signature)}, k=${keys.publicValue}`;
+}
+
+async function sendStandardWebPush(subscription, payload, options = {}) {
+  const keys = webPushKeys();
+  if (!keys) return { skipped: true };
+  const endpoint = String(subscription?.endpoint || '');
+  if (!/^https:\/\//i.test(endpoint)) throw new Error('Invalid Web Push endpoint.');
+  const body = webPushEncrypt(subscription, payload);
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: webPushVapidAuthorization(endpoint, keys),
+      'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream',
+      TTL: String(Math.ceil((options.ttlMs || 60_000) / 1000)),
+      Urgency: options.urgency || 'high'
+    },
+    body
+  });
+  return { ok: response.ok, status: response.status };
+}
 
 function logPushError(label, error) {
   console.error(`[PairLink push] ${label}:`, error?.message || error);
@@ -125,8 +219,9 @@ async function sendPushToUser(userId, payload, options = {}) {
   // A backgrounded app may keep its RTDB socket alive, but the native lock
   // screen owns call presentation there. Only an actually foreground app can
   // consume a call invite live without a push notification.
-  const [tokensSnapshot, online] = await Promise.all([
+  const [tokensSnapshot, subscriptionsSnapshot, online] = await Promise.all([
     userRef.child('pushTokens').get(),
+    userRef.child('webPushSubscriptions').get(),
     options.force ? Promise.resolve(false) : receiverIsOnline(userRef)
   ]);
   // Realtime Database is the live path for foreground devices. For incoming
@@ -145,7 +240,8 @@ async function sendPushToUser(userId, payload, options = {}) {
     if (!uniqueTokens.has(record.token)) uniqueTokens.set(record.token, [key, record]);
   });
   const entries = [...uniqueTokens.values()];
-  if (!entries.length) {
+  const subscriptions = Object.entries(subscriptionsSnapshot.val() || {});
+  if (!entries.length && !subscriptions.length) {
     console.info(`[PairLink push] no offline registered token (${options.kind || 'notification'})`);
     return 0;
   }
@@ -211,8 +307,27 @@ async function sendPushToUser(userId, payload, options = {}) {
     logPushError(`FCM send attempt failed (${options.kind || 'notification'})`, error);
     return 0;
   }
+  const invalidSubscriptionUpdates = {};
+  let standardWebPushEnabled = false;
+  try { standardWebPushEnabled = Boolean(webPushKeys()); }
+  catch (error) { logPushError('Web Push VAPID configuration is invalid', error); }
+  if (standardWebPushEnabled) {
+    const results = await Promise.all(subscriptions.map(async ([key, record]) => {
+      try {
+        const result = await sendStandardWebPush(record, payload, options);
+        if (result.ok) sent++;
+        else if (result.status === 404 || result.status === 410) invalidSubscriptionUpdates[key] = null;
+        else logPushError(`Web Push endpoint returned ${result.status}`, new Error(key));
+      } catch (error) {
+        logPushError('Web Push send failed', error);
+      }
+    }));
+  }
   if (Object.keys(invalidTokenUpdates).length) {
     await userRef.child('pushTokens').update(invalidTokenUpdates).catch((error) => logPushError('could not remove invalid tokens', error));
+  }
+  if (Object.keys(invalidSubscriptionUpdates).length) {
+    await userRef.child('webPushSubscriptions').update(invalidSubscriptionUpdates).catch((error) => logPushError('could not remove expired Web Push subscriptions', error));
   }
   await finishPushDispatch(claim, sent > 0, Boolean(options.consumeOnAttempt));
   console.info(`[PairLink push] ${options.kind || 'notification'} send completed; accepted=${sent}, targets=${entries.length}`);
@@ -326,11 +441,14 @@ async function processInvite(recipientId, snapshot) {
           String(roomCall.callerId || '') !== String(invite.from) ||
           String(roomCall.recipientId || '') !== recipientId) return;
 
-      console.info(`[PairLink push] call wake invite observed (callId=${callId}, recipient=${recipientId}); sending one FCM attempt.`);
+      const callerProfile = await getPushProfile(invite.from);
+      const isVideo = action === 'video' || roomCall.kind === 'video';
+      console.info(`[PairLink push] call invite observed (callId=${callId}, recipient=${recipientId}); sending one push attempt.`);
       await sendPushToUser(recipientId, {
-        // This is deliberately only a wake signal. The receiver resolves the
-        // active call and caller details directly from Firebase after waking.
-        kind: 'incoming_call_wake'
+        kind: 'incoming_call', callId, callerId: invite.from,
+        callerName: String(invite.fromName || roomCall.callerName || callerProfile.name || 'PairLink user'),
+        callerPhoto: compactPhoto(invite.fromPhotoDataUrl, callerProfile.notificationAvatar, callerProfile.photoDataUrl),
+        roomId: invite.roomId, action: isVideo ? 'video' : 'call', video: isVideo ? 'true' : 'false'
       }, { ttlMs: 45_000, collapseKey: `call-${callId}`, kind: 'call', eventId: callId, consumeOnAttempt: true });
     } finally {
       // Exactly one wake-up attempt per call. All subsequent call control is
@@ -426,9 +544,8 @@ async function processCallCancellation(recipientId, snapshot) {
       return Boolean(state?.acceptedAt || state?.status === 'accepted');
     });
   }
-  // Room session state already ends/rejects the live call on both devices.
-  // Render must not send a second call-ended push. It only relays a true
-  // missed-call timeout, which Firebase has explicitly marked as "missed".
+  // The call-ended push removes the lock-screen/browser ringing alert on every
+  // device. A missed-call push is a separate, non-ringing notification.
   let missedPushSent = 1;
   if (isRecipientTerminal && callerId && terminalStatus === 'missed' && !wasAccepted) {
     const callerProfile = await getPushProfile(callerId);
@@ -448,7 +565,13 @@ async function processCallCancellation(recipientId, snapshot) {
       eventId: callId
     });
   }
-  if (missedPushSent > 0) {
+  let endedPushSent = 1;
+  if (isRecipientTerminal && callRecipientId) {
+    endedPushSent = await sendPushToUser(callRecipientId, { kind: 'call_ended', callId }, {
+      ttlMs: 60_000, collapseKey: `call-ended-${callId}`, kind: 'call-ended', eventId: callId
+    });
+  }
+  if (missedPushSent > 0 && endedPushSent > 0) {
     const completedDispatches = [
       db.ref(`users/${cancellation.from}/pushDispatches/${pushDispatchKey('call', callId)}`),
       db.ref(`users/${recipientId}/pushDispatches/${pushDispatchKey('call', callId)}`),
@@ -504,6 +627,7 @@ async function processPendingMessage(recipientId, snapshot) {
       const messageId = String(message.id || snapshot.key);
       await sendPushToUser(recipientId, {
         kind: 'incoming_message',
+        queueId: String(snapshot.key || ''),
         roomId: String(message.roomId || ''),
         messageId,
         senderId: String(message.from),
@@ -561,9 +685,13 @@ async function processPendingCall(recipientId, snapshot) {
         String(roomCall.callerId || '') !== String(call.from) ||
         String(roomCall.recipientId || '') !== recipientId) return;
 
+    const profile = await getPushProfile(call.from);
+    const isVideo = call.video === true || call.action === 'video' || roomCall.kind === 'video';
     await sendPushToUser(recipientId, {
-      // Call metadata stays in Firebase; Render only wakes the Android client.
-      kind: 'incoming_call_wake'
+      kind: 'incoming_call', callId: String(call.callId), callerId: String(call.from),
+      callerName: String(call.fromName || profile.name || 'PairLink user'),
+      callerPhoto: compactPhoto(call.fromPhotoDataUrl, profile.notificationAvatar, profile.photoDataUrl),
+      roomId: String(call.roomId), action: isVideo ? 'video' : 'call', video: isVideo ? 'true' : 'false'
     }, {
       ttlMs: 45_000,
       collapseKey: `call-${call.callId}`,
@@ -668,7 +796,18 @@ async function processPushQueueItem(snapshot) {
       ? item.senderProfile
       : await getPushProfile(item.from);
 
-    if (isCall) {
+    if (item.type === 'call-ended') {
+      await sendPushToUser(recipientId, {
+        kind: 'call_ended', callId: String(item.callId || eventId)
+      }, { ttlMs: 60_000, collapseKey: `call-ended-${eventId}`, kind: 'call-ended', eventId, force: true });
+      await snapshot.ref.remove().catch(() => {});
+    } else if (isCall) {
+      // Foreground clients consume this durable invite directly from
+      // pushQueue, even while viewing another chat. Do not race the live
+      // listener with an FCM push and delete the invite underneath it.
+      const currentInvite = await snapshot.ref.get().catch(() => null);
+      if (!currentInvite?.exists()) return;
+      if (await receiverIsOnline(db.ref(`users/${recipientId}`))) return;
       const isVideo = Boolean(item.video || item.action === 'video');
       await sendPushToUser(recipientId, {
         kind: 'incoming_call',
@@ -679,13 +818,14 @@ async function processPushQueueItem(snapshot) {
         video: isVideo ? 'true' : 'false',
         roomId: item.roomId || '',
         action: isVideo ? 'video' : 'call'
-      }, { ttlMs: 60_000, kind: 'call-wake', eventId, force: true });
+      }, { ttlMs: 60_000, kind: 'call-wake', eventId });
       console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
       await snapshot.ref.remove().catch(() => {});
     } else if (item.type === 'chat-alert') {
       if (item.pushSentAt) return;
       const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
+        queueId: String(snapshot.key || ''),
         roomId: String(item.roomId || ''),
         messageId: String(item.messageId || eventId),
         senderId: String(item.from),
@@ -695,18 +835,42 @@ async function processPushQueueItem(snapshot) {
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'online-message-alert', eventId, force: true });
       console.info(`[PairLink push] Render sent a generic chat reminder for recipient ${recipientId} (messageId=${eventId}).`);
       if (sent > 0) {
-        await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
-        const cleanupTimer = setTimeout(() => snapshot.ref.remove().catch(() => {}), 60_000);
-        cleanupTimer.unref?.();
+        // Do not recreate an alert row if the client already deleted it after
+        // importing the message. A plain update on a removed RTDB child would
+        // resurrect a partial pushQueue record.
+        const marked = await snapshot.ref.transaction((current) =>
+          current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
+        if (marked?.snapshot?.exists()) {
+          const cleanupTimer = setTimeout(() => snapshot.ref.remove().catch(() => {}), 60_000);
+          cleanupTimer.unref?.();
+        }
       } else {
         await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
       }
     } else if (item.type === 'missed_call') {
       if (item.pushSentAt) return;
+      const missedCallId = String(item.callId || eventId);
+      const missedRoomId = String(item.roomId || '');
+      if (!missedRoomId) {
+        await snapshot.ref.remove().catch(() => {});
+        return;
+      }
+      const liveCall = (await db.ref(`rooms/${missedRoomId}/callSessions/${missedCallId}`).get().catch(() => null))?.val();
+      const missedRecord = (await db.ref(`users/${recipientId}/missedCalls/${missedCallId}`).get().catch(() => null))?.val();
+      const hasCurrentMissedRecord = missedRecord?.status === 'missed' &&
+        String(missedRecord.roomId || '') === missedRoomId;
+      const hasCurrentTimeoutSession = liveCall?.status === 'missed' && liveCall?.endedBy === 'timeout';
+      if (!hasCurrentMissedRecord && !hasCurrentTimeoutSession) {
+        // A reject/end may clear a timeout queue item while this dispatcher is
+        // already processing its child_added snapshot. Revalidate the canonical
+        // room session immediately before producing a missed-call push.
+        await snapshot.ref.remove().catch(() => {});
+        return;
+      }
       const sent = await sendPushToUser(recipientId, {
         kind: 'missed_call',
-        callId: String(item.callId || eventId),
-        roomId: String(item.roomId || ''),
+        callId: missedCallId,
+        roomId: missedRoomId,
         callerId: String(item.callerId || item.from),
         callerName: String(item.fromName || profile.name || 'PairLink user'),
         callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
@@ -731,6 +895,8 @@ async function processPushQueueItem(snapshot) {
       await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
     } else {
       if (item.pushSentAt) return; // Already notified, waiting for receiver to pick up
+      const latestQueueItem = (await snapshot.ref.get().catch(() => null))?.val();
+      if (!latestQueueItem || latestQueueItem.pushSentAt) return;
       const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
         queueId: String(snapshot.key || eventId),
@@ -744,7 +910,8 @@ async function processPushQueueItem(snapshot) {
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
       console.info(`[PairLink push] Render sent MESSAGE push notification for recipient ${recipientId} (messageId=${eventId}).`);
       // Mark as notified in pushQueue, DO NOT delete until recipient opens app and downloads it!
-      await snapshot.ref.update({ pushSentAt: Date.now() }).catch(() => {});
+      await snapshot.ref.transaction((current) =>
+        current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => {});
     }
   } catch (error) {
     logPushError(`pushQueue dispatch failed for ${recipientId}`, error);
