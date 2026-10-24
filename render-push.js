@@ -401,7 +401,9 @@ async function routeCallRequest(input = {}) {
     type: 'call',
     from: callerId,
     fromName: String(call.callerName || 'PairLink user'),
-    ...(call.callerPhoto ? { fromPhotoDataUrl: String(call.callerPhoto) } : {}),
+    ...((activeInvite.fromPhotoDataUrl || activeInvite.callerPhoto || call.callerPhoto)
+      ? { fromPhotoDataUrl: String(activeInvite.fromPhotoDataUrl || activeInvite.callerPhoto || call.callerPhoto) }
+      : {}),
     to: recipientId,
     roomId,
     action,
@@ -769,6 +771,7 @@ async function enqueueRenderChatReminder(input = {}) {
     from,
     to,
     fromName: String(input.fromName || 'PairLink user').slice(0, 120),
+    senderProfile: { name: String(input.fromName || 'PairLink user').slice(0, 120), notificationAvatar: compactPhoto(input.senderPhoto) },
     roomId,
     sentAt: Number(input.sentAt) || Date.now(),
     createdAt: Date.now()
