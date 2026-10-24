@@ -449,7 +449,7 @@ async function processInvite(recipientId, snapshot) {
       await sendPushToUser(recipientId, {
         kind: 'incoming_call', callId, callerId: invite.from,
         callerName: String(invite.fromName || roomCall.callerName || callerProfile.name || 'PairLink user'),
-        callerPhoto: compactPhoto(invite.fromPhotoDataUrl, callerProfile.notificationAvatar, callerProfile.photoDataUrl),
+        senderPhoto: compactPhoto(invite.fromPhotoDataUrl, callerProfile.notificationAvatar, callerProfile.photoDataUrl),
         roomId: invite.roomId, action: isVideo ? 'video' : 'call', video: isVideo ? 'true' : 'false'
       }, { ttlMs: 45_000, collapseKey: `call-${callId}`, kind: 'call', eventId: callId, consumeOnAttempt: true });
     } finally {
@@ -558,7 +558,7 @@ async function processCallCancellation(recipientId, snapshot) {
       roomId: String(cancellation.roomId || callState.roomId || ''),
       callerId,
       callerName: String(callerProfile.name || callerId),
-      callerPhoto: compactPhoto(callerProfile.notificationAvatar, callerProfile.photoDataUrl),
+      senderPhoto: compactPhoto(callerProfile.notificationAvatar, callerProfile.photoDataUrl),
       video: cancellation.video === true || callState.kind === 'video' ? 'true' : 'false'
     }, {
       ttlMs: 7 * 24 * 60 * 60 * 1000,
@@ -570,7 +570,7 @@ async function processCallCancellation(recipientId, snapshot) {
   let endedPushSent = 1;
   if (isRecipientTerminal && callRecipientId) {
     endedPushSent = await sendPushToUser(callRecipientId, { kind: 'call_ended', callId }, {
-      ttlMs: 60_000, collapseKey: `call-ended-${callId}`, kind: 'call-ended', eventId: callId
+      ttlMs: 60_000, collapseKey: `call-ended-${callId}`, kind: 'call-ended', eventId: callId, force: true
     });
   }
   if (missedPushSent > 0 && endedPushSent > 0) {
@@ -693,7 +693,7 @@ async function processPendingCall(recipientId, snapshot) {
     await sendPushToUser(recipientId, {
       kind: 'incoming_call', callId: String(call.callId), callerId: String(call.from),
       callerName: String(call.fromName || profile.name || 'PairLink user'),
-      callerPhoto: compactPhoto(call.fromPhotoDataUrl, profile.notificationAvatar, profile.photoDataUrl),
+      senderPhoto: compactPhoto(call.fromPhotoDataUrl, profile.notificationAvatar, profile.photoDataUrl),
       roomId: String(call.roomId), action: isVideo ? 'video' : 'call', video: isVideo ? 'true' : 'false'
     }, {
       ttlMs: 45_000,
@@ -818,7 +818,7 @@ async function processPushQueueItem(snapshot) {
         callId: String(item.callId || eventId),
         callerId: item.from,
         callerName: item.fromName || profile.name || 'PairLink user',
-        callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         video: isVideo ? 'true' : 'false',
         roomId: item.roomId || '',
         action: isVideo ? 'video' : 'call'
@@ -877,7 +877,7 @@ async function processPushQueueItem(snapshot) {
         roomId: missedRoomId,
         callerId: String(item.callerId || item.from),
         callerName: String(item.fromName || profile.name || 'PairLink user'),
-        callerPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         video: item.video === true || item.video === 'true' || item.action === 'video' ? 'true' : 'false'
       }, { ttlMs: 7 * 24 * 60 * 60 * 1000, collapseKey: `missed-${eventId}`, kind: 'missed-call', eventId });
       if (sent > 0) await snapshot.ref.remove().catch(() => {});
