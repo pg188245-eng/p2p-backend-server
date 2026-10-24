@@ -632,6 +632,7 @@ async function processPendingMessage(recipientId, snapshot) {
         messageId,
         senderId: String(message.from),
         senderName: String(message.fromName || profile.name || 'PairLink user'),
+        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         alertOnly: 'true'
       }, {
         ttlMs: MAX_PUSH_AGE_MS,
@@ -889,6 +890,7 @@ async function processPushQueueItem(snapshot) {
         targetMediaId: item.mediaId || '',
         senderId: item.from,
         senderName: item.fromName || profile.name || 'PairLink user',
+        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         action: 'sync_chat'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'deletion-sync', eventId, force: true });
       console.info(`[PairLink push] Render sent DELETION push for recipient ${recipientId} (id=${eventId}).`);
