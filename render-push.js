@@ -527,53 +527,17 @@ async function processCallCancellation(recipientId, snapshot) {
   if (!cancellation || cancellation.pushSentAt || cancellation.to !== recipientId ||
       !cancellation.from || !cancellation.callId) return;
   const callId = String(cancellation.callId);
-  const inviteId = String(cancellation.inviteId || '');
-  const callerId = String(cancellation.callerId || '');
   const callRecipientId = String(cancellation.recipientId || '');
-  const terminalStatus = String(cancellation.status || 'ended');
   const isRecipientTerminal = Boolean(callRecipientId && recipientId === callRecipientId && cancellation.to === recipientId);
-  let callStateSnapshots = [];
-  let wasAccepted = false;
-  if (isRecipientTerminal && callerId) {
-    const participantIds = [...new Set([callerId, callRecipientId])];
-    const [acceptanceSnapshots, stateSnapshots] = await Promise.all([
-      Promise.all(participantIds.map((userId) => db.ref(`users/${userId}/callAcceptances/${callId}`).get().catch(() => null))),
-      Promise.all(participantIds.map((userId) => db.ref(`users/${userId}/callStates/${callId}`).get().catch(() => null)))
-    ]);
-    callStateSnapshots = stateSnapshots;
-    wasAccepted = acceptanceSnapshots.concat(stateSnapshots).some((item) => {
-      const state = item?.val();
-      return Boolean(state?.acceptedAt || state?.status === 'accepted');
-    });
-  }
-  // The call-ended push removes the lock-screen/browser ringing alert on every
-  // device. A missed-call push is a separate, non-ringing notification.
-  let missedPushSent = 1;
-  if (isRecipientTerminal && callerId && terminalStatus === 'missed' && !wasAccepted) {
-    const callerProfile = await getPushProfile(callerId);
-    const callState = callStateSnapshots.map((item) => item?.val()).find(Boolean) || {};
-    missedPushSent = await sendPushToUser(callRecipientId, {
-      kind: 'missed_call',
-      callId,
-      roomId: String(cancellation.roomId || callState.roomId || ''),
-      callerId,
-      callerName: String(callerProfile.name || callerId),
-      senderPhoto: compactPhoto(callerProfile.notificationAvatar, callerProfile.photoDataUrl),
-      video: cancellation.video === true || callState.kind === 'video' ? 'true' : 'false'
-    }, {
-      ttlMs: 7 * 24 * 60 * 60 * 1000,
-      collapseKey: `missed-${callId}`,
-      kind: 'missed-call',
-      eventId: callId
-    });
-  }
+  // Missed-call alerts are dispatched only from the durable missed_call row
+  // in root pushQueue. This cancellation path only closes any ringing alert.
   let endedPushSent = 1;
   if (isRecipientTerminal && callRecipientId) {
     endedPushSent = await sendPushToUser(callRecipientId, { kind: 'call_ended', callId }, {
       ttlMs: 60_000, collapseKey: `call-ended-${callId}`, kind: 'call-ended', eventId: callId, force: true
     });
   }
-  if (missedPushSent > 0 && endedPushSent > 0) {
+  if (endedPushSent > 0) {
     const completedDispatches = [
       db.ref(`users/${cancellation.from}/pushDispatches/${pushDispatchKey('call', callId)}`),
       db.ref(`users/${recipientId}/pushDispatches/${pushDispatchKey('call', callId)}`),
@@ -858,28 +822,18 @@ async function processPushQueueItem(snapshot) {
       if (item.pushSentAt) return;
       const missedCallId = String(item.callId || eventId);
       const missedRoomId = String(item.roomId || '');
-      if (!missedRoomId) {
-        await snapshot.ref.remove().catch(() => {});
-        return;
-      }
-      const liveCall = (await db.ref(`rooms/${missedRoomId}/callSessions/${missedCallId}`).get().catch(() => null))?.val();
-      const missedRecord = (await db.ref(`users/${recipientId}/missedCalls/${missedCallId}`).get().catch(() => null))?.val();
-      const hasCurrentMissedRecord = missedRecord?.status === 'missed' &&
-        String(missedRecord.roomId || '') === missedRoomId;
-      const hasCurrentTimeoutSession = liveCall?.status === 'missed' && liveCall?.endedBy === 'timeout';
-      if (!hasCurrentMissedRecord && !hasCurrentTimeoutSession) {
-        // A reject/end may clear a timeout queue item while this dispatcher is
-        // already processing its child_added snapshot. Revalidate the canonical
-        // room session immediately before producing a missed-call push.
-        await snapshot.ref.remove().catch(() => {});
-        return;
-      }
+      const callerId = String(item.callerId || item.from || '');
+      if (!missedCallId || !callerId) return;
+      // A missed_call queue row is created only after an unanswered outgoing
+      // call. The queue row is the durable source of truth for push delivery.
       const sent = await sendPushToUser(recipientId, {
         kind: 'missed_call',
         callId: missedCallId,
         queueId: String(snapshot.key || ''),
+        chatMessageId: String(item.chatMessageId || `missed-call-${missedCallId}`),
+        chatQueueId: String(item.chatQueueId || item.chatMessageId || `missed-call-${missedCallId}`),
         roomId: missedRoomId,
-        callerId: String(item.callerId || item.from),
+        callerId,
         callerName: String(item.fromName || profile.name || 'PairLink user'),
         senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         video: item.video === true || item.video === 'true' || item.action === 'video' ? 'true' : 'false'
