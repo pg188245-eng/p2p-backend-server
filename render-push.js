@@ -755,17 +755,24 @@ async function processPushQueueItem(snapshot) {
     await snapshot.ref.remove().catch(() => {});
     return;
   }
-  // Call activity entries belong in chat history but should not create a
-  // second push alongside the dedicated missed-call notification.
+  // Explicitly silent chat rows should not trigger a push.
   if (item.type === 'chat' && item.suppressPush === true) return;
   const recipientId = String(item.to);
   const eventId = String(item.callId || item.messageId || snapshot.key);
   const isCall = item.type === 'call' || item.action === 'call' || item.action === 'video';
 
   try {
-    const profile = item.senderProfile?.notificationAvatar
-      ? item.senderProfile
-      : await getPushProfile(item.from);
+    // The missed-call queue already carries caller details. Do not put a
+    // Firestore profile read in front of its lock-screen push.
+    const profile = item.type === 'missed_call'
+      ? (item.senderProfile || {
+          name: item.fromName || 'PairLink user',
+          notificationAvatar: item.fromNotificationAvatar || '',
+          photoDataUrl: item.fromPhotoDataUrl || ''
+        })
+      : item.senderProfile?.notificationAvatar
+        ? item.senderProfile
+        : await getPushProfile(item.from);
 
     if (item.type === 'call-ended') {
       await sendPushToUser(recipientId, {
@@ -845,7 +852,21 @@ async function processPushQueueItem(snapshot) {
         await snapshot.ref.transaction((current) =>
           current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
       } else {
-        await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
+        let attemptCount = 1;
+        const attempt = await snapshot.ref.transaction((current) => {
+          if (!current || current.pushSentAt) return;
+          const next = Math.max(0, Number(current.pushAttemptCount) || 0) + 1;
+          attemptCount = next;
+          return { ...current, pushAttemptCount: next, lastPushAttemptAt: Date.now() };
+        }, undefined, false).catch(() => null);
+        if (attempt?.snapshot?.exists() && attemptCount < 13) {
+          const timer = setTimeout(async () => {
+            const latest = await snapshot.ref.get().catch(() => null);
+            if (!latest?.exists() || latest.val()?.pushSentAt) return;
+            await processPushQueueItem(latest).catch((error) => logPushError('missed-call push retry failed', error));
+          }, Math.min(60_000, 5_000 * attemptCount));
+          timer.unref?.();
+        }
       }
     } else if (item.type === 'deletion') {
       if (item.pushSentAt) return;
@@ -876,6 +897,8 @@ async function processPushQueueItem(snapshot) {
         senderId: item.from,
         senderName: item.fromName || profile.name || 'PairLink user',
         senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        notificationKind: String(item.notificationKind || ''),
+        callId: String(item.callId || ''),
         action: 'sync_chat',
         encrypted: 'true'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
@@ -905,6 +928,11 @@ function startRenderPushRelay() {
     messaging = getMessaging(app);
     let pushQueueChain = Promise.resolve();
     listenForChildAdded(db.ref('pushQueue'), 'pushQueue', (snapshot) => {
+      if (snapshot.val()?.type === 'missed_call') {
+        console.info(`[PairLink push] missed-call queue row observed (key=${snapshot.key}).`);
+        void processPushQueueItem(snapshot).catch((error) => logPushError('missed-call queue handler failed', error));
+        return;
+      }
       pushQueueChain = pushQueueChain.then(() => processPushQueueItem(snapshot)).catch((err) => {
         logPushError('pushQueue serial processing error', err);
       });
