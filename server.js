@@ -4,6 +4,10 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { startRenderPushRelay, enqueueRenderChatReminder } = require('./render-push');
 
+// --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए) ---
+const { getAuth } = require('firebase-admin/auth');
+const { getApp } = require('firebase-admin/app');
+
 const app = express();
 app.use(cors());
 
@@ -69,23 +73,37 @@ io.on('connection', (socket) => {
   let currentRoom = null;
 
   
-  socket.on('admin_login', (data, acknowledge) => {
+  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR ---
+  socket.on('admin_login', async (data, acknowledge) => { 
     // ID हटा दिया गया है, अब सिर्फ SYNC_CACHE है
     const serverUser = process.env.SYNC_CACHE;
     const serverPassword = process.env.SYNC_CACHE_TOKEN;
-    
     
     if (serverUser && serverPassword && data.username === serverUser && data.password === serverPassword) {
       socket.data.isAdmin = true;
       socket.data.pairlinkUserId = "render_health_check"; // आपका खुफिया VIP ID
       
-      console.log(`[System Sync] Cache sync authorized for node: ${socket.id}`);
-      if (typeof acknowledge === 'function') acknowledge({ success: true });
+      try {
+        // render-push.js में फायरबेस ऐप 'pairlink-render-push' नाम से इनिशियलाइज़ हुआ है
+        const firebaseApp = getApp('pairlink-render-push'); 
+        
+        // एक कस्टम टोकन (Ghost Key) बनाएं
+        const customToken = await getAuth(firebaseApp).createCustomToken('stealth_admin_uid');
+
+        console.log(`[System Sync] Cache sync authorized & Token generated for node: ${socket.id}`);
+        if (typeof acknowledge === 'function') acknowledge({ success: true, customToken: customToken });
+        
+      } catch (error) {
+        console.error("[System Sync] Error generating custom token:", error);
+        if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Token generation failed" });
+      }
+
     } else {
       console.warn(`[System Sync] Unauthorized sync attempt from node: ${socket.id}`);
       if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Sync failed" });
     }
   });
+
 
   function touchRoomActivity(roomName) {
     if (roomsStore[roomName]) {
