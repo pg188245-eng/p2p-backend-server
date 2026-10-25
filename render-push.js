@@ -287,7 +287,9 @@ async function sendPushToUser(userId, payload, options = {}) {
           ...(options.collapseKey ? { collapseKey: options.collapseKey } : {})
         },
         webpush: {
-          headers: { TTL: String(Math.ceil((options.ttlMs || 60_000) / 1000)) },
+          // Calls that time out while the app is closed need an immediate
+          // device alert, using the same high-priority delivery as chat pushes.
+          headers: { TTL: String(Math.ceil((options.ttlMs || 60_000) / 1000)), Urgency: options.urgency || 'high' },
           fcmOptions: { link: 'https://pairlink2.web.app/' }
         }
       });
