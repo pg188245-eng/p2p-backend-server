@@ -791,6 +791,9 @@ async function processPushQueueItem(snapshot) {
     await snapshot.ref.remove().catch(() => {});
     return;
   }
+  // Call activity entries belong in chat history but should not create a
+  // second push alongside the dedicated missed-call notification.
+  if (item.type === 'chat' && item.suppressPush === true) return;
   const recipientId = String(item.to);
   const eventId = String(item.callId || item.messageId || snapshot.key);
   const isCall = item.type === 'call' || item.action === 'call' || item.action === 'video';
@@ -874,13 +877,22 @@ async function processPushQueueItem(snapshot) {
       const sent = await sendPushToUser(recipientId, {
         kind: 'missed_call',
         callId: missedCallId,
+        queueId: String(snapshot.key || ''),
         roomId: missedRoomId,
         callerId: String(item.callerId || item.from),
         callerName: String(item.fromName || profile.name || 'PairLink user'),
         senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         video: item.video === true || item.video === 'true' || item.action === 'video' ? 'true' : 'false'
-      }, { ttlMs: 7 * 24 * 60 * 60 * 1000, collapseKey: `missed-${eventId}`, kind: 'missed-call', eventId });
-      if (sent > 0) await snapshot.ref.remove().catch(() => {});
+      }, { ttlMs: 7 * 24 * 60 * 60 * 1000, collapseKey: `missed-${eventId}`, kind: 'missed-call', eventId, force: true });
+      if (sent > 0) {
+        // Keep the missed-call row until the receiving app/service worker
+        // acknowledges it. A transaction avoids recreating a row already
+        // removed by a fast recipient.
+        await snapshot.ref.transaction((current) =>
+          current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
+      } else {
+        await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
+      }
     } else if (item.type === 'deletion') {
       if (item.pushSentAt) return;
       await sendPushToUser(recipientId, {
