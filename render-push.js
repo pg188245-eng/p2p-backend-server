@@ -818,7 +818,7 @@ async function processPushQueueItem(snapshot) {
         callId: String(item.callId || eventId),
         callerId: item.from,
         callerName: item.fromName || profile.name || 'PairLink user',
-        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+        senderPhoto: compactPhoto(item.fromPhotoDataUrl, item.callerPhoto, profile.notificationAvatar, profile.photoDataUrl),
         video: isVideo ? 'true' : 'false',
         roomId: item.roomId || '',
         action: isVideo ? 'video' : 'call'
