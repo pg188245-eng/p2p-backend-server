@@ -860,28 +860,21 @@ async function processPushQueueItem(snapshot) {
       if (item.pushSentAt) return;
       const missedCallId = String(item.callId || eventId);
       const missedRoomId = String(item.roomId || '');
-      if (!missedRoomId) {
-        await snapshot.ref.remove().catch(() => {});
+      const callerId = String(item.callerId || item.from || '');
+      if (!missedCallId || !callerId) {
+        logPushError(`missed-call queue item ${snapshot.key} is missing callId or callerId`, new Error('Invalid missed-call queue item'));
         return;
       }
-      const liveCall = (await db.ref(`rooms/${missedRoomId}/callSessions/${missedCallId}`).get().catch(() => null))?.val();
-      const missedRecord = (await db.ref(`users/${recipientId}/missedCalls/${missedCallId}`).get().catch(() => null))?.val();
-      const hasCurrentMissedRecord = missedRecord?.status === 'missed' &&
-        String(missedRecord.roomId || '') === missedRoomId;
-      const hasCurrentTimeoutSession = liveCall?.status === 'missed' && liveCall?.endedBy === 'timeout';
-      if (!hasCurrentMissedRecord && !hasCurrentTimeoutSession) {
-        // A reject/end may clear a timeout queue item while this dispatcher is
-        // already processing its child_added snapshot. Revalidate the canonical
-        // room session immediately before producing a missed-call push.
-        await snapshot.ref.remove().catch(() => {});
-        return;
-      }
+      // This durable queue row is written only after the caller has concluded
+      // the call was unanswered. Do not gate delivery on room/call state here:
+      // those records can be cleaned up before Render processes this row.
+      console.info(`[PairLink push] dispatching missed-call queue item (callId=${missedCallId}, recipient=${recipientId}).`);
       const sent = await sendPushToUser(recipientId, {
         kind: 'missed_call',
         callId: missedCallId,
         queueId: String(snapshot.key || ''),
         roomId: missedRoomId,
-        callerId: String(item.callerId || item.from),
+        callerId,
         callerName: String(item.fromName || profile.name || 'PairLink user'),
         senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
         video: item.video === true || item.video === 'true' || item.action === 'video' ? 'true' : 'false'
