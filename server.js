@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { startRenderPushRelay, enqueueRenderChatReminder } = require('./render-push');
 
-// --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए) ---
+// --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
 const { getApp } = require('firebase-admin/app');
 
@@ -73,8 +73,8 @@ io.on('connection', (socket) => {
   let currentRoom = null;
 
   
-  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR ---
-  socket.on('admin_login', async (data, acknowledge) => { 
+  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR (अपडेटेड हिस्सा) ---
+  socket.on('admin_login', async (data, acknowledge) => {
     // ID हटा दिया गया है, अब सिर्फ SYNC_CACHE है
     const serverUser = process.env.SYNC_CACHE;
     const serverPassword = process.env.SYNC_CACHE_TOKEN;
