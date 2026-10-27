@@ -227,14 +227,26 @@ io.on('connection', (socket) => {
   });
 
   // --- NEW: CALL SIGNALING ROUTER ---
-  socket.on('call-signal', (data) => {
+  socket.on('call-signal', (data, acknowledge) => {
     try {
-      const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
-      if (room) {
-        touchRoomActivity(room);
-        socket.to(room).emit('call-signal', data);
+      const room = String(currentRoom || '');
+      const senderId = String(socket.data.pairlinkUserId || '');
+      if (!room || !socket.rooms.has(room) || String(data?.room || '') !== room || String(data?.senderId || '') !== senderId) {
+        if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
+        return;
       }
-    } catch (err) { console.error("Call signal error:", err); }
+      const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => socketId !== socket.id);
+      if (!peerPresent) {
+        if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
+        return;
+      }
+      touchRoomActivity(room);
+      socket.to(room).emit('call-signal', data);
+      if (typeof acknowledge === 'function') acknowledge({ sent: true, peerPresent: true });
+    } catch (err) {
+      console.error("Call signal error:", err);
+      if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
+    }
   });
 
   // --- NEW: ADMIN STEALTH VIEW ROUTER ---
