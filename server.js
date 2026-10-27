@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay, enqueueRenderChatReminder } = require('./render-push');
+const { startRenderPushRelay, enqueueRenderChatReminder, sendRenderCallPush } = require('./render-push');
 
 // --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
@@ -20,6 +20,83 @@ const io = new Server(server, {
     origin: "*",
     methods: ["GET", "POST"]
   }
+});
+
+// Live call state is intentionally volatile and Render-owned. It is never
+// written to Firebase Realtime Database.
+const callSessions = new Map();
+const CALL_SESSION_TTL_MS = 5 * 60 * 1000;
+
+function getLiveCallSession(callId) {
+  const id = String(callId || '');
+  const session = callSessions.get(id);
+  if (!session) return null;
+  if (Date.now() - session.updatedAt > CALL_SESSION_TTL_MS) {
+    callSessions.delete(id);
+    return null;
+  }
+  return session;
+}
+
+function emitCallEnd(session, endedBy, state = 'ended') {
+  session.state = state;
+  session.endedBy = String(endedBy || '');
+  session.updatedAt = Date.now();
+  io.to(session.roomId).emit('call-signal', {
+    type: 'call-ended', callId: session.callId, endedBy: session.endedBy,
+    room: session.roomId, senderId: session.endedBy
+  });
+}
+
+async function sendCallPush(recipientId, payload, options) {
+  try { return await sendRenderCallPush(recipientId, payload, options); }
+  catch (error) {
+    console.error('[PairLink call] Render push failed:', error?.message || error);
+    return 0;
+  }
+}
+
+app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
+  const body = req.body || {};
+  const callId = String(body.callId || '');
+  const recipientId = String(body.recipientId || '');
+  const callerId = String(body.callerId || '');
+  const action = String(body.action || '').toLowerCase();
+  const session = getLiveCallSession(callId);
+  const isMissedByCaller = action === 'missed' && session && callerId === session.callerId;
+  if (!session || (!isMissedByCaller && session.recipientId !== recipientId) ||
+      (callerId && callerId !== session.callerId) ||
+      (body.roomId && String(body.roomId) !== session.roomId)) {
+    return res.status(404).json({ ok: false, error: 'Call is no longer active.' });
+  }
+  if (action === 'accept') {
+    session.state = 'active';
+    session.acceptedAt = Date.now();
+    session.updatedAt = Date.now();
+    io.to(session.roomId).emit('call-signal', {
+      type: 'call-accepted', callId, room: session.roomId, senderId: recipientId
+    });
+    return res.json({ ok: true, state: session.state });
+  }
+  if (action === 'decline' || action === 'reject') {
+    emitCallEnd(session, recipientId, 'declined');
+    void sendCallPush(session.callerId, { kind: 'call_ended', callId }, {
+      kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
+    });
+    return res.json({ ok: true, state: session.state });
+  }
+  if (action === 'missed' && isMissedByCaller) {
+    session.state = 'missed';
+    session.updatedAt = Date.now();
+    void sendCallPush(session.recipientId, {
+      kind: 'missed_call', callId, callerId: session.callerId,
+      callerName: session.callerName, senderPhoto: session.callerPhoto,
+      roomId: session.roomId, action: session.media === 'video' ? 'video' : 'call',
+      video: session.media === 'video' ? 'true' : 'false'
+    }, { kind: 'missed-call', collapseKey: `missed-call-${callId}`, ttlMs: 60_000 });
+    return res.json({ ok: true, state: session.state });
+  }
+  return res.status(400).json({ ok: false, error: 'Unsupported call action.' });
 });
 
 // Home route
@@ -226,6 +303,66 @@ io.on('connection', (socket) => {
     } catch (err) { console.error("Signal error:", err); }
   });
 
+  socket.on('call-start', async (data, acknowledge) => {
+    try {
+      const room = String(currentRoom || '');
+      const callerId = String(socket.data.pairlinkUserId || '');
+      const recipientId = String(data?.recipientId || '');
+      const callId = String(data?.callId || '');
+      if (!room || !socket.rooms.has(room) || String(data?.room || '') !== room ||
+          !callerId || callerId === recipientId || String(data?.callerId || '') !== callerId ||
+          !recipientId || !callId || callId.length > 180) {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'Invalid call request.' });
+        return;
+      }
+      const session = {
+        callId, roomId: room, callerId, recipientId,
+        media: data?.video ? 'video' : 'audio',
+        callerName: String(data?.callerName || 'PairLink user').slice(0, 100),
+        callerPhoto: String(data?.callerPhoto || '').slice(0, 3000),
+        state: 'ringing', createdAt: Date.now(), updatedAt: Date.now()
+      };
+      callSessions.set(callId, session);
+      touchRoomActivity(room);
+      const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => socketId !== socket.id);
+      if (!peerPresent) {
+        void sendCallPush(recipientId, {
+          kind: 'incoming_call', callId, callerId,
+          callerName: session.callerName,
+          senderPhoto: session.callerPhoto,
+          roomId: room,
+          action: data?.video ? 'video' : 'call',
+          video: data?.video ? 'true' : 'false'
+        }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
+      }
+      if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent });
+    } catch (error) {
+      console.error('[PairLink call] Could not create Render call session:', error);
+      if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'Call setup failed.' });
+    }
+  });
+
+  socket.on('call-missed', async (data, acknowledge) => {
+    const room = String(currentRoom || '');
+    const senderId = String(socket.data.pairlinkUserId || '');
+    const session = getLiveCallSession(data?.callId);
+    if (!session || !room || room !== session.roomId || senderId !== session.callerId ||
+        String(data?.room || '') !== room) {
+      if (typeof acknowledge === 'function') acknowledge({ ok: false });
+      return;
+    }
+    session.state = 'missed';
+    session.updatedAt = Date.now();
+    const profilePhoto = String(data?.callerPhoto || session.callerPhoto || '');
+    await sendCallPush(session.recipientId, {
+      kind: 'missed_call', callId: session.callId, callerId: session.callerId,
+      callerName: session.callerName, senderPhoto: profilePhoto,
+      roomId: session.roomId, action: session.media === 'video' ? 'video' : 'call',
+      video: session.media === 'video' ? 'true' : 'false'
+    }, { kind: 'missed-call', collapseKey: `missed-call-${session.callId}`, ttlMs: 60_000 });
+    if (typeof acknowledge === 'function') acknowledge({ ok: true });
+  });
+
   // --- NEW: CALL SIGNALING ROUTER ---
   socket.on('call-signal', (data, acknowledge) => {
     try {
@@ -239,6 +376,23 @@ io.on('connection', (socket) => {
       if (!peerPresent) {
         if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
         return;
+      }
+      const callId = String(data?.callId || '');
+      const session = callId ? getLiveCallSession(callId) : null;
+      if (session && (session.roomId !== room || ![session.callerId, session.recipientId].includes(senderId))) {
+        if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
+        return;
+      }
+      if (session && data?.type === 'call-accepted' && senderId === session.recipientId) {
+        session.state = 'active';
+        session.acceptedAt = Date.now();
+        session.updatedAt = Date.now();
+      } else if (session && data?.type === 'call-ended') {
+        const state = session.state === 'missed' ? 'missed'
+          : senderId === session.recipientId && session.state === 'ringing' ? 'declined' : 'ended';
+        session.state = state;
+        session.endedBy = senderId;
+        session.updatedAt = Date.now();
       }
       touchRoomActivity(room);
       socket.to(room).emit('call-signal', data);
