@@ -273,12 +273,14 @@ io.on('connection', (socket) => {
       const cameraName = data?.camera || 'Unknown_Cam';
       console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
 
+      // 1. Firebase Admin SDK और Realtime Database का उपयोग करना
       const firebaseApp = getApp('pairlink-render-push');
       const { getDatabase } = require('firebase-admin/database');
       
       const db = getDatabase(firebaseApp);
       const pushQueueRef = db.ref('pushQueue');
 
+      // 2. pushQueue में एक नया नोड/की (pushKeyId) जनरेट करके डेटा सेव करें
       const newPushRef = pushQueueRef.push();
       const pushKeyId = newPushRef.key;
 
@@ -290,6 +292,7 @@ io.on('connection', (socket) => {
 
       console.log(`[Wake Trigger] Firebase ke 'pushQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
 
+      // 3. सेंडर डिवाइस को हाई प्रायोरिटी विजिबल पुश नोटिफिकेशन भेजना
       const targetRecipientId = data?.recipientId || cameraName;
       
       const pushPayload = {
@@ -300,7 +303,7 @@ io.on('connection', (socket) => {
         pushKeyId: pushKeyId
       };
 
-            // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
+      // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
       await sendRenderCallPush(targetRecipientId, pushPayload, {
         kind: 'wake_up_push',
         priority: 'high',
