@@ -210,16 +210,6 @@ async function receiverIsOnline(userRef) {
   return hasFreshForegroundDevice(snapshot.val());
 }
 
-async function isRenderUserForeground(userId) {
-  if (!db || !String(userId || '')) return false;
-  try {
-    return await receiverIsOnline(db.ref(`users/${String(userId)}`));
-  } catch (error) {
-    logPushError('could not read call recipient foreground presence', error);
-    return false;
-  }
-}
-
 async function receiverIsInChatRoom(roomId, userId) {
   if (!roomId || !userId) return false;
   const snapshot = await db.ref(`rooms/${roomId}/users/${userId}`).get();
@@ -394,162 +384,8 @@ async function sendRenderCallPush(userId, payload, options = {}) {
   });
 }
 
-async function routeCallRequest(input = {}) {
-  const callerId = String(input.callerId || '').trim();
-  const recipientId = String(input.recipientId || '').trim();
-  const roomId = String(input.roomId || '').trim();
-  const callId = String(input.callId || '').trim();
-  if (!callerId || !recipientId || callerId === recipientId || !roomId || !callId) {
-    const error = new Error('Invalid call-routing request.');
-    error.status = 400;
-    throw error;
-  }
-  await sendRenderCallPush(recipientId, {
-    kind: 'incoming_call', callId, callerId,
-    callerName: String(input.callerName || 'PairLink user'),
-    ...(input.callerPhoto ? { senderPhoto: String(input.callerPhoto) } : {}),
-    roomId, action: input.video ? 'video' : 'call', video: input.video ? 'true' : 'false'
-  }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
-  return { route: 'render', callId };
-}
-async function processInvite(recipientId, snapshot) {
-  const invite = snapshot.val();
-  if (!invite || invite.pushSentAt || invite.to !== recipientId || !invite.from || !invite.roomId) return;
-  const action = String(invite.action || '');
-  const ageMs = Date.now() - Number(invite.createdAt || 0);
-  if (!Number.isFinite(ageMs) || ageMs < -60_000) return;
-
-  if (action === 'call' || action === 'video') {
-    try {
-      if (ageMs > 60_000) return;
-      const callId = String(invite.callId || snapshot.key);
-      // The Firebase room session is authoritative. The invite exists only to
-      // request one Render wake-up push for a non-visible receiver.
-      const [cancellationSnapshots, roomCallSnapshot] = await Promise.all([
-        Promise.all([recipientId, invite.from].map((userId) =>
-          db.ref(`users/${userId}/callCancellations/${callId}`).get().catch(() => null))),
-        db.ref(`rooms/${invite.roomId}/callSessions/${callId}`).get().catch(() => null)
-      ]);
-      const roomCall = roomCallSnapshot?.val();
-      if (cancellationSnapshots.some((item) => item?.exists()) ||
-          !roomCall || roomCall.status !== 'ringing' ||
-          String(roomCall.callerId || '') !== String(invite.from) ||
-          String(roomCall.recipientId || '') !== recipientId) return;
-
-      const callerProfile = await getPushProfile(invite.from);
-      const isVideo = action === 'video' || roomCall.kind === 'video';
-      console.info(`[PairLink push] call invite observed (callId=${callId}, recipient=${recipientId}); sending one push attempt.`);
-      await sendPushToUser(recipientId, {
-        kind: 'incoming_call', callId, callerId: invite.from,
-        callerName: String(invite.fromName || roomCall.callerName || callerProfile.name || 'PairLink user'),
-        senderPhoto: compactPhoto(invite.fromPhotoDataUrl, callerProfile.notificationAvatar, callerProfile.photoDataUrl),
-        roomId: invite.roomId, action: isVideo ? 'video' : 'call', video: isVideo ? 'true' : 'false'
-      }, { ttlMs: 45_000, collapseKey: `call-${callId}`, kind: 'call', eventId: callId, consumeOnAttempt: true });
-    } finally {
-      // Exactly one wake-up attempt per call. All subsequent call control is
-      // room-local Firebase signaling, never a second Render invite.
-      await snapshot.ref.remove().catch((error) => logPushError('could not remove one-shot call invite', error));
-    }
-    return;
-  }
-
-}
-
-async function processLiveCallInvite(recipientId, snapshot) {
-  const invite = snapshot.val();
-  if (!invite || !['call', 'video'].includes(String(invite.action || ''))) return;
-  try {
-    const isForeground = await receiverIsOnline(db.ref(`users/${recipientId}`));
-    if (isForeground) {
-      watchLiveCallInviteForOfflineFallback(recipientId, snapshot);
-      console.info(`[PairLink push] live call invite belongs to foreground receiver; watching visibility for fallback (callId=${invite.callId || snapshot.key}).`);
-      return;
-    }
-  } catch (error) {
-    logPushError('could not verify live-call receiver presence; falling back to push', error);
-  }
-  return processInvite(recipientId, snapshot);
-}
-
-function watchLiveCallInviteForOfflineFallback(recipientId, snapshot) {
-  const inviteId = String(snapshot.key || '');
-  const watcherKey = `${recipientId}:${inviteId}`;
-  if (!inviteId || liveCallFallbacks.has(watcherKey)) return;
-  liveCallFallbacks.add(watcherKey);
-
-  const inviteRef = db.ref(`users/${recipientId}/liveCallInvites/${inviteId}`);
-  const devicesRef = db.ref(`users/${recipientId}/devices`);
-  let busy = false;
-  let timer = null;
-  const cleanup = () => {
-    devicesRef.off('value', onDevicesChanged);
-    inviteRef.off('value', onInviteChanged);
-    if (timer) clearTimeout(timer);
-    liveCallFallbacks.delete(watcherKey);
-  };
-  const onInviteChanged = (current) => {
-    if (!current.exists()) cleanup();
-  };
-  const onDevicesChanged = (devices) => {
-    if (busy || hasFreshForegroundDevice(devices.val())) return;
-    busy = true;
-    inviteRef.get().then((current) => {
-      cleanup();
-      if (current.exists()) return processInvite(recipientId, current);
-      return undefined;
-    }).catch((error) => {
-      cleanup();
-      logPushError('could not fall back from live invite to offline call push', error);
-    });
-  };
-
-  inviteRef.on('value', onInviteChanged, (error) => {
-    cleanup();
-    logPushError('live call invite fallback listener failed', error);
-  });
-  devicesRef.on('value', onDevicesChanged, (error) => {
-    cleanup();
-    logPushError('live call visibility listener failed', error);
-  });
-  timer = setTimeout(cleanup, 60_000);
-  timer.unref?.();
-}
-
-async function processCallCancellation(recipientId, snapshot) {
-  const cancellation = snapshot.val();
-  if (!cancellation || cancellation.pushSentAt || cancellation.to !== recipientId ||
-      !cancellation.from || !cancellation.callId) return;
-  const callId = String(cancellation.callId);
-  const callRecipientId = String(cancellation.recipientId || '');
-  const isRecipientTerminal = Boolean(callRecipientId && recipientId === callRecipientId && cancellation.to === recipientId);
-  // Missed-call alerts are dispatched only from the durable missed_call row
-  // in root pushQueue. This cancellation path only closes any ringing alert.
-  let endedPushSent = 1;
-  if (isRecipientTerminal && callRecipientId) {
-    endedPushSent = await sendPushToUser(callRecipientId, { kind: 'call_ended', callId }, {
-      ttlMs: 60_000, collapseKey: `call-ended-${callId}`, kind: 'call-ended', eventId: callId, force: true
-    });
-  }
-  if (endedPushSent > 0) {
-    const completedDispatches = [
-      db.ref(`users/${cancellation.from}/pushDispatches/${pushDispatchKey('call', callId)}`),
-      db.ref(`users/${recipientId}/pushDispatches/${pushDispatchKey('call', callId)}`),
-      db.ref(`users/${recipientId}/pushDispatches/${pushDispatchKey('call-ended', callId)}`)
-    ];
-    await Promise.all(completedDispatches.map((ref) => ref.remove().catch((error) =>
-      logPushError('could not remove completed call push record', error))));
-    // Keep the terminal marker available to live clients for a short grace
-    // period. FCM acceptance is not proof that an active WebView consumed the
-    // event, and immediate deletion can race its RTDB listener.
-    await snapshot.ref.update({ pushSentAt: Date.now() });
-    setTimeout(() => snapshot.ref.remove().catch((error) =>
-      logPushError('could not expire completed call cancellation', error)), 60_000);
-  }
-}
-
 async function processPendingMessage(recipientId, snapshot) {
   const message = snapshot.val();
-  if (message?.type === 'call') return processPendingCall(recipientId, snapshot);
   if (message?.type === 'reaction') return processPendingReaction(recipientId, snapshot);
   if (!message || message.pushSentAt || !message.from || message.to !== recipientId) return;
   const ageMs = Date.now() - Number(message.sentAt || message.createdAt || 0);
@@ -630,45 +466,6 @@ async function processPendingMessage(recipientId, snapshot) {
   }
 }
 
-async function processPendingCall(recipientId, snapshot) {
-  const call = snapshot.val();
-  try {
-    if (!call || call.pushSentAt || !call.from || call.to !== recipientId || !call.roomId || !call.callId) return;
-    console.info(`[PairLink push] pending call wake row observed (callId=${call.callId}, recipient=${recipientId}); validating and sending one wake push.`);
-    const ageMs = Date.now() - Number(call.sentAt || call.createdAt || 0);
-    if (!Number.isFinite(ageMs) || ageMs < -60_000 || ageMs > 60_000) return;
-
-    // A pending inbox entry only asks Render to wake the receiver. Firebase's
-    // shared room call session remains authoritative for whether it is ringing.
-    const roomCall = (await db.ref(`rooms/${call.roomId}/callSessions/${call.callId}`).get()).val();
-    if (!roomCall || roomCall.status !== 'ringing' ||
-        String(roomCall.callerId || '') !== String(call.from) ||
-        String(roomCall.recipientId || '') !== recipientId) return;
-
-    const profile = await getPushProfile(call.from);
-    const isVideo = call.video === true || call.action === 'video' || roomCall.kind === 'video';
-    await sendPushToUser(recipientId, {
-      kind: 'incoming_call', callId: String(call.callId), callerId: String(call.from),
-      callerName: String(call.fromName || profile.name || 'PairLink user'),
-      senderPhoto: compactPhoto(call.fromPhotoDataUrl, profile.notificationAvatar, profile.photoDataUrl),
-      roomId: String(call.roomId), action: isVideo ? 'video' : 'call', video: isVideo ? 'true' : 'false'
-    }, {
-      ttlMs: 45_000,
-      collapseKey: `call-${call.callId}`,
-      kind: 'call',
-      eventId: String(call.callId),
-      consumeOnAttempt: true,
-      force: true
-    });
-  } catch (error) {
-    logPushError('one-shot call wake-up failed', error);
-  } finally {
-    // One inbox row produces at most one attempt, whether FCM accepts or fails.
-    // Remove it after the attempt so it cannot produce a second ring.
-    await snapshot.ref.remove().catch((error) => logPushError('could not remove one-shot call inbox row', error));
-  }
-}
-
 async function processPendingReaction(recipientId, snapshot) {
   const reaction = snapshot.val();
   if (!reaction || reaction.pushSentAt || reaction.to !== recipientId || !reaction.from || !reaction.roomId || !reaction.emoji) return;
@@ -744,6 +541,14 @@ function listenForChildAdded(ref, label, handler) {
 
 async function processPushQueueItem(snapshot) {
   const item = snapshot.val();
+  if (item && (['call', 'missed_call', 'call-ended'].includes(String(item.type || '')) ||
+      String(item.notificationKind || '') === 'missed_call' ||
+      ['call', 'video'].includes(String(item.action || '')))) {
+    // Call signaling, call invites, and missed-call delivery are Render-owned.
+    // Remove stale legacy rows without using them to route or send a call.
+    await snapshot.ref.remove().catch(() => {});
+    return;
+  }
   if (!item || !item.to || !item.from) {
     await snapshot.ref.remove().catch(() => {});
     return;
@@ -751,48 +556,13 @@ async function processPushQueueItem(snapshot) {
   // Explicitly silent chat rows should not trigger a push.
   if (item.type === 'chat' && item.suppressPush === true) return;
   const recipientId = String(item.to);
-  const eventId = String(item.callId || item.messageId || snapshot.key);
-  const isCall = item.type === 'call' || item.action === 'call' || item.action === 'video';
+  const eventId = String(item.messageId || snapshot.key);
+  const profile = item.senderProfile?.notificationAvatar
+    ? item.senderProfile
+    : await getPushProfile(item.from);
 
   try {
-    // The missed-call queue already carries caller details. Do not put a
-    // Firestore profile read in front of its lock-screen push.
-    const profile = item.type === 'missed_call'
-      ? (item.senderProfile || {
-          name: item.fromName || 'PairLink user',
-          notificationAvatar: item.fromNotificationAvatar || '',
-          photoDataUrl: item.fromPhotoDataUrl || ''
-        })
-      : item.senderProfile?.notificationAvatar
-        ? item.senderProfile
-        : await getPushProfile(item.from);
-
-    if (item.type === 'call-ended') {
-      await sendPushToUser(recipientId, {
-        kind: 'call_ended', callId: String(item.callId || eventId)
-      }, { ttlMs: 60_000, collapseKey: `call-ended-${eventId}`, kind: 'call-ended', eventId, force: true });
-      await snapshot.ref.remove().catch(() => {});
-    } else if (isCall) {
-      // Foreground clients consume this durable invite directly from
-      // pushQueue, even while viewing another chat. Do not race the live
-      // listener with an FCM push and delete the invite underneath it.
-      const currentInvite = await snapshot.ref.get().catch(() => null);
-      if (!currentInvite?.exists()) return;
-      if (await receiverIsOnline(db.ref(`users/${recipientId}`))) return;
-      const isVideo = Boolean(item.video || item.action === 'video');
-      await sendPushToUser(recipientId, {
-        kind: 'incoming_call',
-        callId: String(item.callId || eventId),
-        callerId: item.from,
-        callerName: item.fromName || profile.name || 'PairLink user',
-        senderPhoto: compactPhoto(item.fromPhotoDataUrl, item.callerPhoto, profile.notificationAvatar, profile.photoDataUrl),
-        video: isVideo ? 'true' : 'false',
-        roomId: item.roomId || '',
-        action: isVideo ? 'video' : 'call'
-      }, { ttlMs: 60_000, kind: 'call-wake', eventId });
-      console.info(`[PairLink push] Render sent CALL push notification for recipient ${recipientId} (callId=${item.callId}).`);
-      await snapshot.ref.remove().catch(() => {});
-    } else if (item.type === 'chat-alert') {
+    if (item.type === 'chat-alert') {
       if (item.pushSentAt) return;
       const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
@@ -817,49 +587,6 @@ async function processPushQueueItem(snapshot) {
         }
       } else {
         await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
-      }
-    } else if (item.type === 'missed_call') {
-      if (item.pushSentAt) return;
-      const missedCallId = String(item.callId || eventId);
-      const missedRoomId = String(item.roomId || '');
-      const callerId = String(item.callerId || item.from || '');
-      if (!missedCallId || !callerId) return;
-      // A missed_call queue row is created only after an unanswered outgoing
-      // call. The queue row is the durable source of truth for push delivery.
-      const sent = await sendPushToUser(recipientId, {
-        kind: 'missed_call',
-        callId: missedCallId,
-        queueId: String(snapshot.key || ''),
-        chatMessageId: String(item.chatMessageId || `missed-call-${missedCallId}`),
-        chatQueueId: String(item.chatQueueId || item.chatMessageId || `missed-call-${missedCallId}`),
-        roomId: missedRoomId,
-        callerId,
-        callerName: String(item.fromName || profile.name || 'PairLink user'),
-        senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
-        video: item.video === true || item.video === 'true' || item.action === 'video' ? 'true' : 'false'
-      }, { ttlMs: 7 * 24 * 60 * 60 * 1000, collapseKey: `missed-${eventId}`, kind: 'missed-call', eventId, force: true });
-      if (sent > 0) {
-        // Keep the missed-call row until the receiving app/service worker
-        // acknowledges it. A transaction avoids recreating a row already
-        // removed by a fast recipient.
-        await snapshot.ref.transaction((current) =>
-          current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
-      } else {
-        let attemptCount = 1;
-        const attempt = await snapshot.ref.transaction((current) => {
-          if (!current || current.pushSentAt) return;
-          const next = Math.max(0, Number(current.pushAttemptCount) || 0) + 1;
-          attemptCount = next;
-          return { ...current, pushAttemptCount: next, lastPushAttemptAt: Date.now() };
-        }, undefined, false).catch(() => null);
-        if (attempt?.snapshot?.exists() && attemptCount < 13) {
-          const timer = setTimeout(async () => {
-            const latest = await snapshot.ref.get().catch(() => null);
-            if (!latest?.exists() || latest.val()?.pushSentAt) return;
-            await processPushQueueItem(latest).catch((error) => logPushError('missed-call push retry failed', error));
-          }, Math.min(60_000, 5_000 * attemptCount));
-          timer.unref?.();
-        }
       }
     } else if (item.type === 'deletion') {
       if (item.pushSentAt) return;
@@ -890,8 +617,6 @@ async function processPushQueueItem(snapshot) {
         senderId: item.from,
         senderName: item.fromName || profile.name || 'PairLink user',
         senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
-        notificationKind: String(item.notificationKind || ''),
-        callId: String(item.callId || ''),
         action: 'sync_chat',
         encrypted: 'true'
       }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
@@ -921,11 +646,6 @@ function startRenderPushRelay() {
     messaging = getMessaging(app);
     let pushQueueChain = Promise.resolve();
     listenForChildAdded(db.ref('pushQueue'), 'pushQueue', (snapshot) => {
-      if (snapshot.val()?.type === 'missed_call') {
-        console.info(`[PairLink push] missed-call queue row observed (key=${snapshot.key}).`);
-        void processPushQueueItem(snapshot).catch((error) => logPushError('missed-call queue handler failed', error));
-        return;
-      }
       pushQueueChain = pushQueueChain.then(() => processPushQueueItem(snapshot)).catch((err) => {
         logPushError('pushQueue serial processing error', err);
       });
@@ -939,4 +659,4 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, enqueueRenderChatReminder, routeCallRequest, sendRenderCallPush, isRenderUserForeground };
+module.exports = { startRenderPushRelay, enqueueRenderChatReminder, sendRenderCallPush };
