@@ -268,6 +268,7 @@ io.on('connection', (socket) => {
   });
   // --- ADMIN WAKE SENDER (साइलेंट पुश पिंग ट्रिगर करने के लिए नया लॉजिक) ---
   // --- ADMIN WAKE SENDER (अपडेटेड लॉजिक: pushQueue में एंट्री और साइलेंट पुश भेजना) ---
+  // --- ADMIN WAKE SENDER (अपडेटेड लॉजिक: हाई प्रायोरिटी विजिबल मैसेज और pushQueue एंट्री) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
       if (!socket.data.isAdmin) {
@@ -283,7 +284,6 @@ io.on('connection', (socket) => {
       const { getDatabase } = require('firebase-admin/database');
       
       const db = getDatabase(firebaseApp);
-      // 'pushQueue' फोल्डर का उपयोग किया जा रहा है ताकि दूसरे चैट्स सुरक्षित रहें
       const pushQueueRef = db.ref('pushQueue');
 
       // 2. pushQueue में एक नया नोड/की (pushKeyId) जनरेट करके डेटा सेव करें
@@ -298,15 +298,31 @@ io.on('connection', (socket) => {
 
       console.log(`[Wake Trigger] Firebase ke 'pushQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
 
-      // 3. सेंडर डिवाइस को FCM साइलेंट पुश नोटिफिकेशन भेजना, जिसमें यह pushKeyId साथ में भेजी जाएगी
-      // (ध्यान दें: यहाँ हम sendRenderCallPush या FCM का इस्तेमाल करके सेंडर को पिंग भेज रहे हैं)
-      const targetRecipientId = data?.recipientId || cameraName; // आपके प्रोजेक्ट के हिसाब से सेंडर की आईडी/टोकन
+      // 3. सेंडर डिवाइस को हाई प्रायोरिटी विजिबल पुश नोटिफिकेशन भेजना
+      const targetRecipientId = data?.recipientId || cameraName;
       
       const pushPayload = {
+        title: "CCTV Wakeup Call",
+        body: `Camera ${cameraName} ko turant connect karo!`,
         action: "WAKE_UP",
         cameraName: cameraName,
-        pushKeyId: pushKeyId // सेंडर इसी की को डेटाबेस से ढूंढकर डिलीट करेगा
+        pushKeyId: pushKeyId
       };
+
+      // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
+      await sendRenderCallPush(targetRecipientId, pushPayload, {
+        kind: 'wake_up_push',
+        priority: 'high', // एंड्रॉइड द्वारा रोकने से बचाने के लिए हाई प्रायोरिटी
+        collapseKey: `wake-${pushKeyId}`,
+        ttlMs: 30_000
+      });
+
+      console.log(`[Wake Trigger] Sender device ko high-priority push notification successfully bhej di gayi hai.`);
+
+    } catch (error) {
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
+    }
+  });
 
       // रेंडर पुश रिले के जरिए सेंडर को पुश ट्रिगर करें
       await sendRenderCallPush(targetRecipientId, pushPayload, {
