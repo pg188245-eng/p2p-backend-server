@@ -116,6 +116,9 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
   }
   if (action === 'decline' || action === 'reject') {
     emitCallEnd(session, recipientId, 'declined');
+    void sendCallPush(session.recipientId, { kind: 'call_ended', callId }, {
+      kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
+    });
     void sendCallPush(session.callerId, { kind: 'call_ended', callId }, {
       kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
     });
