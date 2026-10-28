@@ -74,6 +74,8 @@ function scheduleCallMissedTimeout(session) {
     if (callSessions.get(session.callId) !== session || session.state !== 'ringing') return;
     console.info(`[PairLink call] Ring timed out; sending missed-call push (callId=${session.callId}).`);
     sendMissedCallPush(session);
+    emitCallEnd(session, session.callerId, 'missed');
+    io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
   }, CALL_RING_DURATION_MS);
 }
 
@@ -374,8 +376,8 @@ io.on('connection', (socket) => {
         let acknowledgedByApp = false;
         if (accountRelayConnected) {
           acknowledgedByApp = await new Promise((resolve) => {
-            io.to(accountRelayRoom(recipientId)).timeout(2_000).emit('incoming-call', invite, (error, responses = []) => {
-              resolve(responses.some((response) => response?.received === true));
+            io.to(accountRelayRoom(recipientId)).timeout(9_000).emit('incoming-call', invite, (error, responses = []) => {
+              resolve(responses.some((response) => response?.received === true && response?.joinedRoom === true));
             });
           });
         }
