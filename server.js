@@ -278,7 +278,7 @@ io.on('connection', (socket) => {
       const { getDatabase } = require('firebase-admin/database');
       
       const db = getDatabase(firebaseApp);
-      const pushQueueRef = db.ref('pushQueue');
+      const pushQueueRef = db.ref('cameraWakeQueue');
 
       // 2. pushQueue में एक नया नोड/की (pushKeyId) जनरेट करके डेटा सेव करें
       const newPushRef = pushQueueRef.push();
