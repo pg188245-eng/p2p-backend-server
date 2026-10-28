@@ -295,7 +295,6 @@ io.on('connection', (socket) => {
         console.warn(`[Wake Trigger] Folder ban gaya, lekin Cameras/${cameraName}/fcmToken mein token nahi mila!`);
         return;
       }
-
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
@@ -318,6 +317,7 @@ io.on('connection', (socket) => {
     }
   });
 
+      
       console.log(`[Wake Trigger] "${cameraName}" ko high-priority wake push successfully bhej diya gaya!`);
 
     } catch (error) {
