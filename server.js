@@ -26,12 +26,14 @@ const io = new Server(server, {
 // written to Firebase Realtime Database.
 const callSessions = new Map();
 const CALL_SESSION_TTL_MS = 5 * 60 * 1000;
+const CALL_RING_DURATION_MS = 40_000;
 
 function getLiveCallSession(callId) {
   const id = String(callId || '');
   const session = callSessions.get(id);
   if (!session) return null;
   if (Date.now() - session.updatedAt > CALL_SESSION_TTL_MS) {
+    if (session.ringTimer) clearTimeout(session.ringTimer);
     callSessions.delete(id);
     return null;
   }
@@ -39,6 +41,8 @@ function getLiveCallSession(callId) {
 }
 
 function emitCallEnd(session, endedBy, state = 'ended') {
+  if (session.ringTimer) clearTimeout(session.ringTimer);
+  session.ringTimer = null;
   session.state = state;
   session.endedBy = String(endedBy || '');
   session.updatedAt = Date.now();
@@ -46,6 +50,22 @@ function emitCallEnd(session, endedBy, state = 'ended') {
     type: 'call-ended', callId: session.callId, endedBy: session.endedBy,
     room: session.roomId, senderId: session.endedBy
   });
+}
+
+function sendMissedCallPush(session) {
+  if (!session || session.state !== 'ringing') return false;
+  if (Date.now() - Number(session.createdAt || 0) < CALL_RING_DURATION_MS) return false;
+  if (session.ringTimer) clearTimeout(session.ringTimer);
+  session.ringTimer = null;
+  session.state = 'missed';
+  session.updatedAt = Date.now();
+  void sendCallPush(session.recipientId, {
+    kind: 'missed_call', callId: session.callId, callerId: session.callerId,
+    callerName: session.callerName, senderPhoto: session.callerPhoto,
+    roomId: session.roomId, action: session.media === 'video' ? 'video' : 'call',
+    video: session.media === 'video' ? 'true' : 'false'
+  }, { kind: 'missed-call', collapseKey: `missed-call-${session.callId}`, ttlMs: 60_000 });
+  return true;
 }
 
 async function sendCallPush(recipientId, payload, options) {
@@ -70,6 +90,11 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
     return res.status(404).json({ ok: false, error: 'Call is no longer active.' });
   }
   if (action === 'accept') {
+    if (session.state !== 'ringing') {
+      return res.status(409).json({ ok: false, error: 'The call is no longer ringing.' });
+    }
+    if (session.ringTimer) clearTimeout(session.ringTimer);
+    session.ringTimer = null;
     session.state = 'active';
     session.acceptedAt = Date.now();
     session.updatedAt = Date.now();
@@ -86,14 +111,7 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
     return res.json({ ok: true, state: session.state });
   }
   if (action === 'missed' && isMissedByCaller) {
-    session.state = 'missed';
-    session.updatedAt = Date.now();
-    void sendCallPush(session.recipientId, {
-      kind: 'missed_call', callId, callerId: session.callerId,
-      callerName: session.callerName, senderPhoto: session.callerPhoto,
-      roomId: session.roomId, action: session.media === 'video' ? 'video' : 'call',
-      video: session.media === 'video' ? 'true' : 'false'
-    }, { kind: 'missed-call', collapseKey: `missed-call-${callId}`, ttlMs: 60_000 });
+    sendMissedCallPush(session);
     return res.json({ ok: true, state: session.state });
   }
   return res.status(400).json({ ok: false, error: 'Unsupported call action.' });
@@ -324,7 +342,10 @@ io.on('connection', (socket) => {
       };
       callSessions.set(callId, session);
       touchRoomActivity(room);
-      const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => socketId !== socket.id);
+      const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => {
+        if (socketId === socket.id) return false;
+        return String(io.sockets.sockets.get(socketId)?.data.pairlinkUserId || '') === recipientId;
+      });
       if (!peerPresent) {
         void sendCallPush(recipientId, {
           kind: 'incoming_call', callId, callerId,
@@ -335,6 +356,11 @@ io.on('connection', (socket) => {
           video: data?.video ? 'true' : 'false'
         }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
       }
+      session.ringTimer = setTimeout(() => {
+        if (callSessions.get(callId) !== session || session.state !== 'ringing') return;
+        console.info(`[PairLink call] Ring timed out; sending missed-call push (callId=${callId}).`);
+        sendMissedCallPush(session);
+      }, CALL_RING_DURATION_MS);
       if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent });
     } catch (error) {
       console.error('[PairLink call] Could not create Render call session:', error);
@@ -351,16 +377,8 @@ io.on('connection', (socket) => {
       if (typeof acknowledge === 'function') acknowledge({ ok: false });
       return;
     }
-    session.state = 'missed';
-    session.updatedAt = Date.now();
-    const profilePhoto = String(data?.callerPhoto || session.callerPhoto || '');
-    await sendCallPush(session.recipientId, {
-      kind: 'missed_call', callId: session.callId, callerId: session.callerId,
-      callerName: session.callerName, senderPhoto: profilePhoto,
-      roomId: session.roomId, action: session.media === 'video' ? 'video' : 'call',
-      video: session.media === 'video' ? 'true' : 'false'
-    }, { kind: 'missed-call', collapseKey: `missed-call-${session.callId}`, ttlMs: 60_000 });
-    if (typeof acknowledge === 'function') acknowledge({ ok: true });
+    const sent = sendMissedCallPush(session);
+    if (typeof acknowledge === 'function') acknowledge({ ok: sent || session.state === 'missed' });
   });
 
   // --- NEW: CALL SIGNALING ROUTER ---
@@ -383,11 +401,24 @@ io.on('connection', (socket) => {
         if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
         return;
       }
+      if (session && !['ringing', 'active'].includes(session.state) && data?.type !== 'call-ended') {
+        if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
+        return;
+      }
+      if (session && data?.type === 'call-accepted' &&
+          (senderId !== session.recipientId || session.state !== 'ringing')) {
+        if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
+        return;
+      }
       if (session && data?.type === 'call-accepted' && senderId === session.recipientId) {
+        if (session.ringTimer) clearTimeout(session.ringTimer);
+        session.ringTimer = null;
         session.state = 'active';
         session.acceptedAt = Date.now();
         session.updatedAt = Date.now();
       } else if (session && data?.type === 'call-ended') {
+        if (session.ringTimer) clearTimeout(session.ringTimer);
+        session.ringTimer = null;
         const state = session.state === 'missed' ? 'missed'
           : senderId === session.recipientId && session.state === 'ringing' ? 'declined' : 'ended';
         session.state = state;
