@@ -19,6 +19,7 @@ let firestore;
 let messaging;
 const liveCallFallbacks = new Set();
 const inMemoryCallPushDispatches = new Map();
+const missedCallDispatchBusy = new Set();
 
 function base64UrlDecode(value) {
   const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
@@ -533,14 +534,72 @@ async function enqueueRenderChatReminder(input = {}) {
   return Boolean(result.snapshot?.exists());
 }
 
+async function enqueueRenderMissedCall(input = {}) {
+  if (!db) throw new Error('Render missed-call queue is not initialized');
+  const callId = String(input.callId || '');
+  const from = String(input.callerId || input.from || '');
+  const to = String(input.recipientId || input.to || '');
+  if (!callId || !from || !to) throw new Error('Missed-call notification is missing its call or user ID');
+  const ref = db.ref(`pushQueue/missed_call_${safeKey(callId)}`);
+  const result = await ref.transaction((current) => current || {
+    type: 'missed_call',
+    notificationKind: 'missed_call',
+    callId,
+    from,
+    to,
+    fromName: String(input.callerName || 'PairLink user').slice(0, 120),
+    senderPhoto: compactPhoto(input.callerPhoto),
+    callType: input.video ? 'video' : 'audio',
+    video: input.video ? 'true' : 'false',
+    createdAt: Date.now()
+  }, undefined, false);
+  return Boolean(result.snapshot?.exists());
+}
+
 function listenForChildAdded(ref, label, handler) {
   ref.on('child_added', (snapshot) => {
     Promise.resolve(handler(snapshot)).catch((error) => logPushError(`${label} handler failed`, error));
   }, (error) => logPushError(`${label} listener failed`, error));
 }
 
-async function processPushQueueItem(snapshot) {
+async function processPushQueueItem(snapshot, { renderOnline = false } = {}) {
   const item = snapshot.val();
+  if (item?.type === 'missed_call' && item.callId) {
+    if (!renderOnline) return;
+    if (item.pushSentAt || missedCallDispatchBusy.has(snapshot.key)) return;
+    missedCallDispatchBusy.add(snapshot.key);
+    try {
+      const sent = await sendPushToUser(String(item.to || ''), {
+        kind: 'missed_call',
+        callId: String(item.callId),
+        callerId: String(item.from || ''),
+        callerName: String(item.fromName || 'PairLink user'),
+        senderPhoto: compactPhoto(item.senderPhoto),
+        callType: String(item.callType || 'audio'),
+        video: String(item.video || 'false')
+      }, {
+        ttlMs: MAX_PUSH_AGE_MS,
+        kind: 'missed-call',
+        eventId: String(item.callId),
+        force: true,
+        persistDispatch: false,
+        dedupeMs: 5 * 60_000
+      });
+      if (sent > 0) {
+        const marked = await snapshot.ref.transaction((current) =>
+          current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
+        if (marked?.snapshot?.exists()) {
+          const cleanupTimer = setTimeout(() => snapshot.ref.remove().catch(() => {}), 60_000);
+          cleanupTimer.unref?.();
+        }
+      } else {
+        await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
+      }
+    } finally {
+      missedCallDispatchBusy.delete(snapshot.key);
+    }
+    return;
+  }
   if (item && (['call', 'missed_call', 'call-ended'].includes(String(item.type || '')) ||
       String(item.notificationKind || '') === 'missed_call' ||
       ['call', 'video'].includes(String(item.action || '')))) {
@@ -630,6 +689,25 @@ async function processPushQueueItem(snapshot) {
   }
 }
 
+async function dispatchQueuedMissedCalls(userId) {
+  if (!db || !messaging) return 0;
+  const recipientId = String(userId || '');
+  if (!recipientId) return 0;
+  const snapshot = await db.ref('pushQueue').orderByChild('type').equalTo('missed_call').get();
+  let dispatched = 0;
+  const jobs = [];
+  snapshot.forEach((child) => {
+    const item = child.val();
+    if (item?.to === recipientId && item.callId && !item.pushSentAt) jobs.push(child);
+  });
+  for (const job of jobs) {
+    await processPushQueueItem(job, { renderOnline: true });
+    const latest = (await job.ref.get().catch(() => null))?.val();
+    if (latest?.pushSentAt) dispatched += 1;
+  }
+  return dispatched;
+}
+
 function startRenderPushRelay() {
   try {
     const serviceAccount = readServiceAccount();
@@ -650,7 +728,6 @@ function startRenderPushRelay() {
         logPushError('pushQueue serial processing error', err);
       });
     });
-
     console.info('[PairLink push] Render is listening only to root pushQueue for push jobs.');
     return true;
   } catch (error) {
@@ -659,4 +736,4 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, enqueueRenderChatReminder, sendRenderCallPush };
+module.exports = { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, dispatchQueuedMissedCalls, sendRenderCallPush };
