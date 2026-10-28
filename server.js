@@ -267,6 +267,7 @@ io.on('connection', (socket) => {
     }
   });
   // --- ADMIN WAKE SENDER (साइलेंट पुश पिंग ट्रिगर करने के लिए नया लॉजिक) ---
+  // --- ADMIN WAKE SENDER (अपडेटेड लॉजिक: pushQueue में एंट्री और साइलेंट पुश भेजना) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
       if (!socket.data.isAdmin) {
@@ -277,23 +278,47 @@ io.on('connection', (socket) => {
       const cameraName = data?.camera || 'Unknown_Cam';
       console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
 
-      // आपके render-push.js से फायरबेस ऐप और डेटाबेस का उपयोग करके 'push_key' फोल्डर में पिंग भेजना
+      // 1. Firebase Admin SDK और Realtime Database का उपयोग करना
       const firebaseApp = getApp('pairlink-render-push');
       const { getDatabase } = require('firebase-admin/database');
       
       const db = getDatabase(firebaseApp);
-      const pushKeyRef = db.ref('push_key');
+      // 'pushQueue' फोल्डर का उपयोग किया जा रहा है ताकि दूसरे चैट्स सुरक्षित रहें
+      const pushQueueRef = db.ref('pushQueue');
 
-      // डेटाबेस में साइलेंट वेक-अप पिंग एंट्री करना (जिस पर रेंडर/फायरबेस का बैकएंड नजर रखता है)
-      await pushKeyRef.push({
+      // 2. pushQueue में एक नया नोड/की (pushKeyId) जनरेट करके डेटा सेव करें
+      const newPushRef = pushQueueRef.push();
+      const pushKeyId = newPushRef.key;
+
+      await newPushRef.set({
         action: "WAKE_UP",
         cameraName: cameraName,
         timestamp: Date.now()
       });
 
-      console.log(`[Wake Trigger] Firebase ke 'push_key' folder mein successfully ping daal diya gaya hai.`);
+      console.log(`[Wake Trigger] Firebase ke 'pushQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
+
+      // 3. सेंडर डिवाइस को FCM साइलेंट पुश नोटिफिकेशन भेजना, जिसमें यह pushKeyId साथ में भेजी जाएगी
+      // (ध्यान दें: यहाँ हम sendRenderCallPush या FCM का इस्तेमाल करके सेंडर को पिंग भेज रहे हैं)
+      const targetRecipientId = data?.recipientId || cameraName; // आपके प्रोजेक्ट के हिसाब से सेंडर की आईडी/टोकन
+      
+      const pushPayload = {
+        action: "WAKE_UP",
+        cameraName: cameraName,
+        pushKeyId: pushKeyId // सेंडर इसी की को डेटाबेस से ढूंढकर डिलीट करेगा
+      };
+
+      // रेंडर पुश रिले के जरिए सेंडर को पुश ट्रिगर करें
+      await sendRenderCallPush(targetRecipientId, pushPayload, {
+        kind: 'wake_up_push',
+        collapseKey: `wake-${pushKeyId}`,
+        ttlMs: 30_000
+      });
+
+      console.log(`[Wake Trigger] Sender device ko push notification successfully bhej di gayi hai.`);
+
     } catch (error) {
-      console.error("[Wake Trigger] Firebase mein data likhne mein error aayi:", error);
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
     }
   });
 
