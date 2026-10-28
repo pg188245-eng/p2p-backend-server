@@ -610,10 +610,39 @@ async function processPushQueueItem(snapshot) {
     await snapshot.ref.remove().catch(() => {});
     return;
   }
-  // Explicitly silent chat rows should not trigger a push.
-  if (item.type === 'chat' && item.suppressPush === true) return;
   const recipientId = String(item.to);
   const eventId = String(item.messageId || snapshot.key);
+  if (item.type === 'chat' && item.suppressPush === true) {
+    if (item.pushSentAt) return;
+    try {
+      const sent = await sendPushToUser(recipientId, {
+        kind: 'incoming_message',
+        silentSync: 'true',
+        queueId: String(snapshot.key || eventId),
+        roomId: String(item.roomId || ''),
+        messageId: eventId,
+        senderId: String(item.from || ''),
+        senderName: String(item.fromName || 'PairLink user'),
+        to: recipientId
+      }, {
+        ttlMs: MAX_PUSH_AGE_MS,
+        kind: 'encrypted-chat-background-sync',
+        eventId,
+        force: true,
+        persistDispatch: false,
+        dedupeMs: 5 * 60_000
+      });
+      if (sent > 0) {
+        await snapshot.ref.transaction((current) =>
+          current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
+      } else {
+        await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
+      }
+    } catch (error) {
+      logPushError(`silent chat sync dispatch failed for ${recipientId}`, error);
+    }
+    return;
+  }
   const profile = item.senderProfile?.notificationAvatar
     ? item.senderProfile
     : await getPushProfile(item.from);
