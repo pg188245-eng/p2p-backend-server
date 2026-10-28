@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, dispatchQueuedMissedCalls, sendRenderCallPush } = require('./render-push');
+const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, sendRenderCallPush } = require('./render-push');
 
 // --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
@@ -80,10 +80,6 @@ function queueMissedCallNotification(session) {
   void enqueueRenderMissedCall({
     callId: session.callId, callerId: session.callerId, recipientId: session.recipientId,
     callerName: session.callerName, callerPhoto: session.callerPhoto, video: session.media === 'video'
-  }).then(async (queued) => {
-    if (queued && isRenderUserConnected(session.recipientId)) {
-      await dispatchQueuedMissedCalls(session.recipientId);
-    }
   }).catch((error) => {
     console.error('[PairLink call] Could not queue missed-call notification; sending directly:', error?.message || error);
     void sendCallPush(session.recipientId, {
@@ -360,18 +356,12 @@ io.on('connection', (socket) => {
     socket.data.pairlinkForeground = data?.foreground === true;
     socket.join(accountRelayRoom(userId));
     socket.emit('user_relay_joined', { userId });
-    void dispatchQueuedMissedCalls(userId).catch((error) => {
-      console.error('[PairLink call] Could not dispatch queued missed calls on Render join:', error?.message || error);
-    });
   });
 
   socket.on('set_user_foreground', (data) => {
     const userId = String(socket.data.pairlinkUserId || '');
     if (!userId || String(data?.userId || '') !== userId) return;
     socket.data.pairlinkForeground = data?.foreground === true;
-    void dispatchQueuedMissedCalls(userId).catch((error) => {
-      console.error('[PairLink call] Could not dispatch queued missed calls on Render presence:', error?.message || error);
-    });
   });
 
   socket.on('queue-chat-reminder', (data, acknowledge) => {
