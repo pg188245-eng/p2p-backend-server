@@ -300,21 +300,7 @@ io.on('connection', (socket) => {
         pushKeyId: pushKeyId
       };
 
-      await sendRenderCallPush(targetRecipientId, pushPayload, {
-        kind: 'wake_up_push',
-        priority: 'high',
-        collapseKey: `wake-${pushKeyId}`,
-        ttlMs: 30_000
-      });
-
-      console.log(`[Wake Trigger] Sender device ko high-priority push notification successfully bhej di gayi hai.`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-
-      // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
+            // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
       await sendRenderCallPush(targetRecipientId, pushPayload, {
         kind: 'wake_up_push',
         priority: 'high',
