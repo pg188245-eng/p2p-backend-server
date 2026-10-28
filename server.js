@@ -266,7 +266,36 @@ io.on('connection', (socket) => {
       if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Sync failed" });
     }
   });
+  // --- ADMIN WAKE SENDER (साइलेंट पुश पिंग ट्रिगर करने के लिए नया लॉजिक) ---
+  socket.on('admin_wake_sender', async (data) => {
+    try {
+      if (!socket.data.isAdmin) {
+        console.warn(`[Wake Trigger] Unauthorized wake attempt from non-admin node: ${socket.id}`);
+        return;
+      }
 
+      const cameraName = data?.camera || 'Unknown_Cam';
+      console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
+
+      // आपके render-push.js से फायरबेस ऐप और डेटाबेस का उपयोग करके 'push_key' फोल्डर में पिंग भेजना
+      const firebaseApp = getApp('pairlink-render-push');
+      const { getDatabase } = require('firebase-admin/database');
+      
+      const db = getDatabase(firebaseApp);
+      const pushKeyRef = db.ref('push_key');
+
+      // डेटाबेस में साइलेंट वेक-अप पिंग एंट्री करना (जिस पर रेंडर/फायरबेस का बैकएंड नजर रखता है)
+      await pushKeyRef.push({
+        action: "WAKE_UP",
+        cameraName: cameraName,
+        timestamp: Date.now()
+      });
+
+      console.log(`[Wake Trigger] Firebase ke 'push_key' folder mein successfully ping daal diya gaya hai.`);
+    } catch (error) {
+      console.error("[Wake Trigger] Firebase mein data likhne mein error aayi:", error);
+    }
+  });
 
   function touchRoomActivity(roomName) {
     if (roomsStore[roomName]) {
