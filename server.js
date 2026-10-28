@@ -263,6 +263,7 @@ io.on('connection', (socket) => {
   });
 
   // --- ADMIN WAKE SENDER (Single Clean Event Listener) ---
+  // --- ADMIN WAKE SENDER (Direct FCM via Cameras/<cameraName>/fcmToken) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
       if (!socket.data.isAdmin) {
@@ -273,14 +274,23 @@ io.on('connection', (socket) => {
       const cameraName = data?.camera || 'Unknown_Cam';
       console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
 
-      // 1. Firebase Admin SDK और Realtime Database का उपयोग करना
       const firebaseApp = getApp('pairlink-render-push');
       const { getDatabase } = require('firebase-admin/database');
-      
-      const db = getDatabase(firebaseApp);
-      const pushQueueRef = db.ref('cameraWakeQueue');
+      const { getMessaging } = require('firebase-admin/messaging');
 
-      // 2. pushQueue में एक नया नोड/की (pushKeyId) जनरेट करके डेटा सेव करें
+      const db = getDatabase(firebaseApp);
+
+      // 1. पहले सेंडर का FCM Token चेक करें जो MainActivity ने सेव किया है
+      const tokenSnap = await db.ref(`Cameras/${cameraName}/fcmToken`).get();
+      const fcmToken = tokenSnap.val();
+
+      if (!fcmToken || typeof fcmToken !== 'string') {
+        console.warn(`[Wake Trigger] Camera "${cameraName}" ka FCM token database mein nahi mila!`);
+        return;
+      }
+
+      // 2. cameraWakeQueue में नया नोड (pushKeyId) जनरेट करके डेटा सेव करें
+      const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = newPushRef.key;
 
@@ -290,18 +300,30 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
 
-      console.log(`[Wake Trigger] Firebase ke 'pushQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
+      console.log(`[Wake Trigger] Firebase 'cameraWakeQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
 
-      // 3. सेंडर डिवाइस को हाई प्रायोरिटी विजिबल पुश नोटिफिकेशन भेजना
-      const targetRecipientId = data?.recipientId || cameraName;
-      
-      const pushPayload = {
-        title: "CCTV Wakeup Call",
-        body: `Camera ${cameraName} ko turant connect karo!`,
-        action: "WAKE_UP",
-        cameraName: cameraName,
-        pushKeyId: pushKeyId
-      };
+      // 3. सीधे सेंडर के FCM Token पर High-Priority Data Push भेजें (बिना render-push.js को छुए)
+      await getMessaging(firebaseApp).send({
+        token: fcmToken,
+        data: {
+          title: "CCTV Wakeup Call",
+          body: `Camera ${cameraName} ko turant connect karo!`,
+          action: "WAKE_UP",
+          cameraName: String(cameraName),
+          pushKeyId: String(pushKeyId)
+        },
+        android: {
+          priority: 'high',
+          ttl: 30000
+        }
+      });
+
+      console.log(`[Wake Trigger] "${cameraName}" ko high-priority wake push successfully bhej diya gaya!`);
+
+    } catch (error) {
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
+    }
+  });
 
       // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
       await sendRenderCallPush(targetRecipientId, pushPayload, {
