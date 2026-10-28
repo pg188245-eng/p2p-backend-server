@@ -265,29 +265,16 @@ io.on('connection', (socket) => {
   });
 
   // --- ADMIN WAKE SENDER (Direct FCM via Cameras/<cameraName>/fcmToken) ---
+  // --- ADMIN WAKE SENDER ---
   socket.on('admin_wake_sender', async (data) => {
     try {
-      if (!socket.data.isAdmin) {
-        console.warn(`[Wake Trigger] Unauthorized wake attempt from non-admin node: ${socket.id}`);
-        return;
-      }
-
-      const cameraName = String(data?.camera || data?.recipientId || 'Unknown_Cam').trim();
-      console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
+      const cameraName = String(data?.camera || data?.recipientId || 'Hall_Cam').trim();
+      console.log(`[Wake Trigger] Request received to wake camera: "${cameraName}"`);
 
       const firebaseApp = getApp('pairlink-render-push');
       const db = getDatabase(firebaseApp);
 
-      // 1. Pehle Sender ka FCM Token check karein jo MainActivity.kt ne save kiya hai
-      const tokenSnap = await db.ref(`Cameras/${cameraName}/fcmToken`).get();
-      const fcmToken = tokenSnap.val();
-
-      if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn(`[Wake Trigger] Camera "${cameraName}" ka FCM token database (Cameras/${cameraName}/fcmToken) mein nahi mila!`);
-        return;
-      }
-
-      // 2. cameraWakeQueue mein naya node (pushKeyId) generate karke data save karein
+      // 1. SABSE PEHLE Realtime Database mein 'cameraWakeQueue' folder aur entry banayein!
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = String(newPushRef.key || Date.now());
@@ -298,9 +285,17 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
 
-      console.log(`[Wake Trigger] Firebase 'cameraWakeQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
+      console.log(`[Wake Trigger] Firebase 'cameraWakeQueue/${pushKeyId}' created successfully!`);
 
-      // 3. Seedhe Sender ke FCM Token par High-Priority Data Push bhejein (bina render-push.js chhue)
+      // 2. Ab Sender ka FCM Token utha kar Push Notification bhejein
+      const tokenSnap = await db.ref(`Cameras/${cameraName}/fcmToken`).get();
+      const fcmToken = tokenSnap.val();
+
+      if (!fcmToken || typeof fcmToken !== 'string') {
+        console.warn(`[Wake Trigger] Folder ban gaya, lekin Cameras/${cameraName}/fcmToken mein token nahi mila!`);
+        return;
+      }
+
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
@@ -315,6 +310,13 @@ io.on('connection', (socket) => {
           ttl: 30000
         }
       });
+
+      console.log(`[Wake Trigger] High-priority FCM push sent to "${cameraName}"!`);
+
+    } catch (error) {
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
+    }
+  });
 
       console.log(`[Wake Trigger] "${cameraName}" ko high-priority wake push successfully bhej diya gaya!`);
 
