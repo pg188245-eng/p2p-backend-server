@@ -263,9 +263,7 @@ io.on('connection', (socket) => {
       if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Sync failed" });
     }
   });
-
-  // --- ADMIN WAKE SENDER (Direct FCM via Cameras/<cameraName>/fcmToken) ---
-  // --- ADMIN WAKE SENDER ---
+  // --- ADMIN WAKE SENDER (Clean & Error-Free) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
       const cameraName = String(data?.camera || data?.recipientId || 'Hall_Cam').trim();
@@ -274,7 +272,7 @@ io.on('connection', (socket) => {
       const firebaseApp = getApp('pairlink-render-push');
       const db = getDatabase(firebaseApp);
 
-      // 1. SABSE PEHLE Realtime Database mein 'cameraWakeQueue' folder aur entry banayein!
+      // 1. Sabse pehle Firebase Realtime Database mein 'cameraWakeQueue' folder aur entry banayein
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = String(newPushRef.key || Date.now());
@@ -287,7 +285,7 @@ io.on('connection', (socket) => {
 
       console.log(`[Wake Trigger] Firebase 'cameraWakeQueue/${pushKeyId}' created successfully!`);
 
-      // 2. Ab Sender ka FCM Token utha kar Push Notification bhejein
+      // 2. Sender ka FCM Token utha kar Push Notification bhejein
       const tokenSnap = await db.ref(`Cameras/${cameraName}/fcmToken`).get();
       const fcmToken = tokenSnap.val();
 
@@ -295,6 +293,7 @@ io.on('connection', (socket) => {
         console.warn(`[Wake Trigger] Folder ban gaya, lekin Cameras/${cameraName}/fcmToken mein token nahi mila!`);
         return;
       }
+
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
@@ -310,6 +309,15 @@ io.on('connection', (socket) => {
         }
       });
 
+      console.log(`[Wake Trigger] High-priority FCM push sent to "${cameraName}"!`);
+
+    } catch (error) {
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
+    }
+  });
+
+  
+  
       console.log(`[Wake Trigger] High-priority FCM push sent to "${cameraName}"!`);
 
     } catch (error) {
