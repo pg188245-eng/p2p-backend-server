@@ -562,15 +562,15 @@ function listenForChildAdded(ref, label, handler) {
   }, (error) => logPushError(`${label} listener failed`, error));
 }
 
-async function processPushQueueItem(snapshot, { renderOnline = false } = {}) {
+async function processPushQueueItem(snapshot) {
   const item = snapshot.val();
   if (item?.type === 'missed_call' && item.callId) {
-    if (!renderOnline) return;
     if (item.pushSentAt || missedCallDispatchBusy.has(snapshot.key)) return;
     missedCallDispatchBusy.add(snapshot.key);
     try {
       const sent = await sendPushToUser(String(item.to || ''), {
         kind: 'missed_call',
+        queueId: String(snapshot.key || ''),
         callId: String(item.callId),
         callerId: String(item.from || ''),
         callerName: String(item.fromName || 'PairLink user'),
@@ -586,12 +586,10 @@ async function processPushQueueItem(snapshot, { renderOnline = false } = {}) {
         dedupeMs: 5 * 60_000
       });
       if (sent > 0) {
-        const marked = await snapshot.ref.transaction((current) =>
+        // Keep the queue row until the receiver's worker acknowledges it,
+        // matching encrypted chat notification delivery semantics.
+        await snapshot.ref.transaction((current) =>
           current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
-        if (marked?.snapshot?.exists()) {
-          const cleanupTimer = setTimeout(() => snapshot.ref.remove().catch(() => {}), 60_000);
-          cleanupTimer.unref?.();
-        }
       } else {
         await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
       }
@@ -701,7 +699,7 @@ async function dispatchQueuedMissedCalls(userId) {
     if (item?.to === recipientId && item.callId && !item.pushSentAt) jobs.push(child);
   });
   for (const job of jobs) {
-    await processPushQueueItem(job, { renderOnline: true });
+    await processPushQueueItem(job);
     const latest = (await job.ref.get().catch(() => null))?.val();
     if (latest?.pushSentAt) dispatched += 1;
   }
