@@ -18,6 +18,7 @@ let db;
 let firestore;
 let messaging;
 const liveCallFallbacks = new Set();
+const inMemoryCallPushDispatches = new Map();
 
 function base64UrlDecode(value) {
   const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
@@ -174,6 +175,11 @@ async function claimPushDispatch(userId, payload, options) {
 }
 
 async function finishPushDispatch(claim, accepted, consumeOnFailure = false) {
+  if (claim?.memoryKey) {
+    if (accepted || consumeOnFailure) inMemoryCallPushDispatches.set(claim.memoryKey, { at: Date.now(), status: accepted ? 'sent' : 'attempted' });
+    else inMemoryCallPushDispatches.delete(claim.memoryKey);
+    return;
+  }
   if (!claim?.ref) return;
   try {
     await claim.ref.transaction((current) => {
@@ -202,6 +208,16 @@ function hasFreshForegroundDevice(devices) {
 async function receiverIsOnline(userRef) {
   const snapshot = await userRef.child('devices').get();
   return hasFreshForegroundDevice(snapshot.val());
+}
+
+async function isRenderUserForeground(userId) {
+  if (!db || !String(userId || '')) return false;
+  try {
+    return await receiverIsOnline(db.ref(`users/${String(userId)}`));
+  } catch (error) {
+    logPushError('could not read call recipient foreground presence', error);
+    return false;
+  }
 }
 
 async function receiverIsInChatRoom(roomId, userId) {
@@ -247,11 +263,22 @@ async function sendPushToUser(userId, payload, options = {}) {
   }
 
   let claim;
-  try {
-    claim = await claimPushDispatch(userId, payload, options);
-  } catch (error) {
-    logPushError('could not claim notification dispatch', error);
-    return 0;
+  if (options.persistDispatch === false) {
+    const eventId = getDispatchEventId(payload, options);
+    const memoryKey = eventId ? `${String(userId)}:${String(options.kind || payload.kind || 'call')}:${eventId}` : '';
+    if (memoryKey) {
+      const previous = inMemoryCallPushDispatches.get(memoryKey);
+      if (previous && Date.now() - previous.at < (options.dedupeMs || 90_000)) return 0;
+      inMemoryCallPushDispatches.set(memoryKey, { at: Date.now(), status: 'sending' });
+    }
+    claim = { allowed: true, memoryKey };
+  } else {
+    try {
+      claim = await claimPushDispatch(userId, payload, options);
+    } catch (error) {
+      logPushError('could not claim notification dispatch', error);
+      return 0;
+    }
   }
   if (!claim.allowed) {
     console.info(`[PairLink push] duplicate dispatch suppressed (${options.kind || 'notification'})`);
@@ -353,72 +380,38 @@ async function getPushProfile(userId) {
   return {};
 }
 
-async function routeCallRequest(input = {}) {
-  if (!db || !firestore || !messaging) throw new Error('Render call router is not initialized');
+async function sendRenderCallPush(userId, payload, options = {}) {
+  if (!db || !messaging) throw new Error('Render call push is not initialized');
+  return sendPushToUser(String(userId || ''), payload, {
+    ttlMs: options.ttlMs || 60_000,
+    collapseKey: options.collapseKey || `call-${String(payload.callId || '')}`,
+    kind: options.kind || String(payload.kind || 'call'),
+    eventId: String(options.eventId || payload.callId || ''),
+    consumeOnAttempt: true,
+    force: true,
+    persistDispatch: false,
+    dedupeMs: options.dedupeMs
+  });
+}
 
+async function routeCallRequest(input = {}) {
   const callerId = String(input.callerId || '').trim();
   const recipientId = String(input.recipientId || '').trim();
   const roomId = String(input.roomId || '').trim();
   const callId = String(input.callId || '').trim();
-  if (!callerId || !recipientId || callerId === recipientId || !roomId || !callId ||
-      callerId.length > 180 || recipientId.length > 180 || roomId.length > 200 || callId.length > 180) {
+  if (!callerId || !recipientId || callerId === recipientId || !roomId || !callId) {
     const error = new Error('Invalid call-routing request.');
     error.status = 400;
     throw error;
   }
-
-  // Accept a route request only for the permanent Firestore room belonging to
-  // this exact user pair, and only while its Firebase call session is ringing.
-  const participants = [callerId, recipientId].sort();
-  const pairKey = createHash('sha256').update(participants.join('|')).digest('hex');
-  const [pairSnapshot, callSnapshot, activeInviteSnapshot] = await Promise.all([
-    firestore.collection('pairRooms').doc(pairKey).get(),
-    db.ref(`rooms/${roomId}/callSessions/${callId}`).get(),
-    db.ref(`users/${recipientId}/activeCallInvites/${callId}`).get()
-  ]);
-  const pair = pairSnapshot.exists ? pairSnapshot.data() : null;
-  const call = callSnapshot.val();
-  const activeInvite = activeInviteSnapshot.val();
-  const pairMatches = pair && String(pair.roomId || '') === roomId &&
-    (!pair.userA || String(pair.userA) === participants[0]) &&
-    (!pair.userB || String(pair.userB) === participants[1]);
-  const callMatches = call && call.status === 'ringing' &&
-    String(call.callerId || '') === callerId && String(call.recipientId || '') === recipientId;
-  const inviteMatches = activeInvite && String(activeInvite.callId || '') === callId &&
-    String(activeInvite.from || activeInvite.callerId || '') === callerId &&
-    String(activeInvite.to || activeInvite.recipientId || '') === recipientId &&
-    String(activeInvite.roomId || '') === roomId;
-  if (!pairMatches || !callMatches || !inviteMatches) {
-    const error = new Error('Call request did not match its Firebase room and active invite.');
-    error.status = 409;
-    throw error;
-  }
-
-  const inviteId = `call_${callId}`;
-  const action = call.kind === 'video' ? 'video' : 'call';
-  const invite = {
-    id: inviteId,
-    type: 'call',
-    from: callerId,
-    fromName: String(call.callerName || 'PairLink user'),
-    ...((activeInvite.fromPhotoDataUrl || activeInvite.callerPhoto || call.callerPhoto)
-      ? { fromPhotoDataUrl: String(activeInvite.fromPhotoDataUrl || activeInvite.callerPhoto || call.callerPhoto) }
-      : {}),
-    to: recipientId,
-    roomId,
-    action,
-    callId,
-    createdAt: Number(call.createdAt) || Date.now(),
-    sentAt: Date.now(),
-    delivery: 'render-routed'
-  };
-
-  const queueRef = db.ref(`pushQueue/call_${safeKey(callId)}`);
-  const queued = await queueRef.transaction((current) => current || invite, undefined, false);
-  console.info(`[PairLink push] Render queued call notification (callId=${callId}).`);
-  return { route: queued.snapshot?.exists() ? 'pushQueue' : 'already-queued', callId };
+  await sendRenderCallPush(recipientId, {
+    kind: 'incoming_call', callId, callerId,
+    callerName: String(input.callerName || 'PairLink user'),
+    ...(input.callerPhoto ? { senderPhoto: String(input.callerPhoto) } : {}),
+    roomId, action: input.video ? 'video' : 'call', video: input.video ? 'true' : 'false'
+  }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
+  return { route: 'render', callId };
 }
-
 async function processInvite(recipientId, snapshot) {
   const invite = snapshot.val();
   if (!invite || invite.pushSentAt || invite.to !== recipientId || !invite.from || !invite.roomId) return;
@@ -946,4 +939,4 @@ function startRenderPushRelay() {
   }
 }
 
-module.exports = { startRenderPushRelay, enqueueRenderChatReminder, routeCallRequest };
+module.exports = { startRenderPushRelay, enqueueRenderChatReminder, routeCallRequest, sendRenderCallPush, isRenderUserForeground };
