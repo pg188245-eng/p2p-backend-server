@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, sendRenderCallPush } = require('./render-push');
+const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, dispatchQueuedMissedCalls, sendRenderCallPush } = require('./render-push');
 
 // --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
@@ -62,6 +62,8 @@ function getLiveCallSession(callId) {
 }
 
 function emitCallEnd(session, endedBy, state = 'ended') {
+  const callerCancelledBeforeAccept = state === 'ended' && session.state === 'ringing' && String(endedBy || '') === session.callerId;
+  if (callerCancelledBeforeAccept) queueMissedCallNotification(session);
   if (session.ringTimer) clearTimeout(session.ringTimer);
   session.ringTimer = null;
   session.state = state;
@@ -74,16 +76,14 @@ function emitCallEnd(session, endedBy, state = 'ended') {
   retireCallSession(session);
 }
 
-function sendMissedCallPush(session) {
-  if (!session || session.state !== 'ringing') return false;
-  if (Date.now() - Number(session.createdAt || 0) < CALL_RING_DURATION_MS) return false;
-  if (session.ringTimer) clearTimeout(session.ringTimer);
-  session.ringTimer = null;
-  session.state = 'missed';
-  session.updatedAt = Date.now();
+function queueMissedCallNotification(session) {
   void enqueueRenderMissedCall({
     callId: session.callId, callerId: session.callerId, recipientId: session.recipientId,
     callerName: session.callerName, callerPhoto: session.callerPhoto, video: session.media === 'video'
+  }).then(async (queued) => {
+    if (queued && isRenderUserConnected(session.recipientId)) {
+      await dispatchQueuedMissedCalls(session.recipientId);
+    }
   }).catch((error) => {
     console.error('[PairLink call] Could not queue missed-call notification; sending directly:', error?.message || error);
     void sendCallPush(session.recipientId, {
@@ -93,6 +93,16 @@ function sendMissedCallPush(session) {
       video: session.media === 'video' ? 'true' : 'false'
     }, { kind: 'missed-call', collapseKey: `missed-call-${session.callId}`, ttlMs: 60_000 });
   });
+}
+
+function sendMissedCallPush(session) {
+  if (!session || session.state !== 'ringing') return false;
+  if (Date.now() - Number(session.createdAt || 0) < CALL_RING_DURATION_MS) return false;
+  if (session.ringTimer) clearTimeout(session.ringTimer);
+  session.ringTimer = null;
+  session.state = 'missed';
+  session.updatedAt = Date.now();
+  queueMissedCallNotification(session);
   return true;
 }
 
@@ -123,7 +133,8 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
   const action = String(body.action || '').toLowerCase();
   const session = getLiveCallSession(callId);
   const isMissedByCaller = action === 'missed' && session && callerId === session.callerId;
-  if (!session || (!isMissedByCaller && session.recipientId !== recipientId) ||
+  const isCallerCancel = action === 'caller-cancel' && session && callerId === session.callerId;
+  if (!session || (!(isMissedByCaller || isCallerCancel) && session.recipientId !== recipientId) ||
       (callerId && callerId !== session.callerId) ||
       (body.roomId && String(body.roomId) !== session.roomId)) {
     return res.status(404).json({ ok: false, error: 'Call is no longer active.' });
@@ -151,6 +162,17 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
       kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
     });
     return res.json({ ok: true, state: session.state });
+  }
+  if (isCallerCancel) {
+    if (session.state !== 'ringing') {
+      return res.status(409).json({ ok: false, error: 'This call is no longer ringing.' });
+    }
+    emitCallEnd(session, callerId, 'ended');
+    io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
+    void sendCallPush(session.recipientId, { kind: 'call_ended', callId: session.callId }, {
+      kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
+    });
+    return res.json({ ok: true, state: 'ended' });
   }
   if (action === 'missed' && isMissedByCaller) {
     const sent = sendMissedCallPush(session);
@@ -181,6 +203,11 @@ app.get('/healthz', (_req, res) => {
 const roomsStore = {};
 const ROOM_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000;
 const accountRelayRoom = (userId) => `pairlink-user:${String(userId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+function isRenderUserConnected(userId) {
+  const room = io.sockets.adapter.rooms.get(accountRelayRoom(userId));
+  return Boolean(room?.size);
+}
 
 function destroyRoom(roomName, notify = true) {
   if (!roomName) return;
@@ -333,12 +360,18 @@ io.on('connection', (socket) => {
     socket.data.pairlinkForeground = data?.foreground === true;
     socket.join(accountRelayRoom(userId));
     socket.emit('user_relay_joined', { userId });
+    void dispatchQueuedMissedCalls(userId).catch((error) => {
+      console.error('[PairLink call] Could not dispatch queued missed calls on Render join:', error?.message || error);
+    });
   });
 
   socket.on('set_user_foreground', (data) => {
     const userId = String(socket.data.pairlinkUserId || '');
     if (!userId || String(data?.userId || '') !== userId) return;
     socket.data.pairlinkForeground = data?.foreground === true;
+    void dispatchQueuedMissedCalls(userId).catch((error) => {
+      console.error('[PairLink call] Could not dispatch queued missed calls on Render presence:', error?.message || error);
+    });
   });
 
   socket.on('queue-chat-reminder', (data, acknowledge) => {
@@ -488,6 +521,8 @@ io.on('connection', (socket) => {
         if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
         return;
       }
+      const callerCancelledWhileRinging = Boolean(session && data?.type === 'call-ended' &&
+        senderId === session.callerId && session.state === 'ringing');
       if (!peerPresent) {
         if (session && data?.type === 'call-ended' && senderId === session.callerId &&
             ['ringing', 'active'].includes(session.state)) {
@@ -533,7 +568,12 @@ io.on('connection', (socket) => {
           callId: session.callId, acceptedBy: senderId
         });
       }
-      if (session && data?.type === 'call-ended') retireCallSession(session);
+      if (session && data?.type === 'call-ended') {
+        if (callerCancelledWhileRinging) queueMissedCallNotification(session);
+        io.to(accountRelayRoom(session.callerId)).emit('call-ended', { callId: session.callId });
+        io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
+        retireCallSession(session);
+      }
       if (typeof acknowledge === 'function') acknowledge({ sent: true, peerPresent: true });
     } catch (err) {
       console.error("Call signal error:", err);
