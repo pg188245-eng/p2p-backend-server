@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay, enqueueRenderChatReminder, sendRenderCallPush } = require('./render-push');
+const { startRenderPushRelay, enqueueRenderChatReminder, sendRenderCallPush, isRenderUserForeground } = require('./render-push');
 
 // --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
@@ -355,22 +355,39 @@ io.on('connection', (socket) => {
         if (socketId === socket.id) return false;
         return String(io.sockets.sockets.get(socketId)?.data.pairlinkUserId || '') === recipientId;
       });
-      if (!peerPresent) {
-        void sendCallPush(recipientId, {
+      const invite = {
           kind: 'incoming_call', callId, callerId,
           callerName: session.callerName,
           senderPhoto: session.callerPhoto,
           roomId: room,
           action: data?.video ? 'video' : 'call',
-          video: data?.video ? 'true' : 'false'
-        }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 })
-          .finally(() => {
-            if (callSessions.get(callId) === session && session.state === 'ringing') scheduleCallMissedTimeout(session);
-          });
+          video: data?.video ? 'true' : 'false',
+          createdAt: session.createdAt
+      };
+      let delivery = 'room';
+      if (!peerPresent) {
+        let foreground = false;
+        try {
+          foreground = await Promise.race([
+            isRenderUserForeground(recipientId),
+            new Promise((resolve) => setTimeout(() => resolve(false), 2000))
+          ]);
+        } catch (_) { foreground = false; }
+        const accountRoom = io.sockets.adapter.rooms.get(accountRelayRoom(recipientId));
+        const accountRelayConnected = Boolean(accountRoom?.size);
+        if (foreground && accountRelayConnected) {
+          io.to(accountRelayRoom(recipientId)).emit('incoming-call', invite);
+          delivery = 'account-relay';
+          scheduleCallMissedTimeout(session);
+        } else {
+          delivery = 'push';
+          scheduleCallMissedTimeout(session);
+          void sendCallPush(recipientId, invite, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
+        }
       } else {
         scheduleCallMissedTimeout(session);
       }
-      if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent });
+      if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent, delivery });
     } catch (error) {
       console.error('[PairLink call] Could not create Render call session:', error);
       if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'Call setup failed.' });
