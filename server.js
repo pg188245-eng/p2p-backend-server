@@ -68,6 +68,15 @@ function sendMissedCallPush(session) {
   return true;
 }
 
+function scheduleCallMissedTimeout(session) {
+  if (session.ringTimer) clearTimeout(session.ringTimer);
+  session.ringTimer = setTimeout(() => {
+    if (callSessions.get(session.callId) !== session || session.state !== 'ringing') return;
+    console.info(`[PairLink call] Ring timed out; sending missed-call push (callId=${session.callId}).`);
+    sendMissedCallPush(session);
+  }, CALL_RING_DURATION_MS);
+}
+
 async function sendCallPush(recipientId, payload, options) {
   try { return await sendRenderCallPush(recipientId, payload, options); }
   catch (error) {
@@ -354,13 +363,13 @@ io.on('connection', (socket) => {
           roomId: room,
           action: data?.video ? 'video' : 'call',
           video: data?.video ? 'true' : 'false'
-        }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
+        }, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 })
+          .finally(() => {
+            if (callSessions.get(callId) === session && session.state === 'ringing') scheduleCallMissedTimeout(session);
+          });
+      } else {
+        scheduleCallMissedTimeout(session);
       }
-      session.ringTimer = setTimeout(() => {
-        if (callSessions.get(callId) !== session || session.state !== 'ringing') return;
-        console.info(`[PairLink call] Ring timed out; sending missed-call push (callId=${callId}).`);
-        sendMissedCallPush(session);
-      }, CALL_RING_DURATION_MS);
       if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent });
     } catch (error) {
       console.error('[PairLink call] Could not create Render call session:', error);
