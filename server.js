@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { startRenderPushRelay, enqueueRenderChatReminder, sendRenderCallPush } = require('./render-push');
+const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, sendRenderCallPush } = require('./render-push');
 
 // --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
@@ -25,16 +25,37 @@ const io = new Server(server, {
 // Live call state is intentionally volatile and Render-owned. It is never
 // written to Firebase Realtime Database.
 const callSessions = new Map();
+const endedCallSessions = new Map();
 const CALL_SESSION_TTL_MS = 5 * 60 * 1000;
 const CALL_RING_DURATION_MS = 40_000;
+const ENDED_CALL_TTL_MS = 5 * 60 * 1000;
+
+function rememberEndedCallSession(callId) {
+  const id = String(callId || '');
+  if (!id) return;
+  endedCallSessions.set(id, Date.now());
+  for (const [endedId, endedAt] of endedCallSessions) {
+    if (Date.now() - endedAt > ENDED_CALL_TTL_MS) endedCallSessions.delete(endedId);
+  }
+}
+
+function retireCallSession(session) {
+  if (!session) return;
+  if (session.ringTimer) clearTimeout(session.ringTimer);
+  session.ringTimer = null;
+  callSessions.delete(session.callId);
+  rememberEndedCallSession(session.callId);
+}
 
 function getLiveCallSession(callId) {
   const id = String(callId || '');
+  if (endedCallSessions.has(id)) return null;
   const session = callSessions.get(id);
   if (!session) return null;
   if (Date.now() - session.updatedAt > CALL_SESSION_TTL_MS) {
     if (session.ringTimer) clearTimeout(session.ringTimer);
     callSessions.delete(id);
+    rememberEndedCallSession(id);
     return null;
   }
   return session;
@@ -50,6 +71,7 @@ function emitCallEnd(session, endedBy, state = 'ended') {
     type: 'call-ended', callId: session.callId, endedBy: session.endedBy,
     room: session.roomId, senderId: session.endedBy
   });
+  retireCallSession(session);
 }
 
 function sendMissedCallPush(session) {
@@ -59,12 +81,18 @@ function sendMissedCallPush(session) {
   session.ringTimer = null;
   session.state = 'missed';
   session.updatedAt = Date.now();
-  void sendCallPush(session.recipientId, {
-    kind: 'missed_call', callId: session.callId, callerId: session.callerId,
-    callerName: session.callerName, senderPhoto: session.callerPhoto,
-    roomId: session.roomId, action: session.media === 'video' ? 'video' : 'call',
-    video: session.media === 'video' ? 'true' : 'false'
-  }, { kind: 'missed-call', collapseKey: `missed-call-${session.callId}`, ttlMs: 60_000 });
+  void enqueueRenderMissedCall({
+    callId: session.callId, callerId: session.callerId, recipientId: session.recipientId,
+    callerName: session.callerName, callerPhoto: session.callerPhoto, video: session.media === 'video'
+  }).catch((error) => {
+    console.error('[PairLink call] Could not queue missed-call notification; sending directly:', error?.message || error);
+    void sendCallPush(session.recipientId, {
+      kind: 'missed_call', callId: session.callId, callerId: session.callerId,
+      callerName: session.callerName, senderPhoto: session.callerPhoto,
+      action: session.media === 'video' ? 'video' : 'call',
+      video: session.media === 'video' ? 'true' : 'false'
+    }, { kind: 'missed-call', collapseKey: `missed-call-${session.callId}`, ttlMs: 60_000 });
+  });
   return true;
 }
 
@@ -125,7 +153,10 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
     return res.json({ ok: true, state: session.state });
   }
   if (action === 'missed' && isMissedByCaller) {
-    sendMissedCallPush(session);
+    const sent = sendMissedCallPush(session);
+    if (!sent) return res.status(409).json({ ok: false, error: 'The ringing period has not ended.' });
+    emitCallEnd(session, callerId, 'missed');
+    io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
     return res.json({ ok: true, state: session.state });
   }
   return res.status(400).json({ ok: false, error: 'Unsupported call action.' });
@@ -299,8 +330,15 @@ io.on('connection', (socket) => {
     const userId = String(data?.userId || '');
     if (!userId) return;
     socket.data.pairlinkUserId = userId;
+    socket.data.pairlinkForeground = data?.foreground === true;
     socket.join(accountRelayRoom(userId));
     socket.emit('user_relay_joined', { userId });
+  });
+
+  socket.on('set_user_foreground', (data) => {
+    const userId = String(socket.data.pairlinkUserId || '');
+    if (!userId || String(data?.userId || '') !== userId) return;
+    socket.data.pairlinkForeground = data?.foreground === true;
   });
 
   socket.on('queue-chat-reminder', (data, acknowledge) => {
@@ -347,6 +385,10 @@ io.on('connection', (socket) => {
         if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'Invalid call request.' });
         return;
       }
+      if (endedCallSessions.has(callId) || callSessions.has(callId)) {
+        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'This call ID was already used.' });
+        return;
+      }
       const session = {
         callId, roomId: room, callerId, recipientId,
         media: data?.video ? 'video' : 'audio',
@@ -369,27 +411,42 @@ io.on('connection', (socket) => {
           video: data?.video ? 'true' : 'false',
           createdAt: session.createdAt
       };
-      // Render owns the entire 40-second ringing window. The session and
-      // timeout stay in memory; no call row or signaling is written to RTDB.
-      scheduleCallMissedTimeout(session);
-      let delivery = 'room';
-      if (!peerPresent) {
-        const accountRoom = io.sockets.adapter.rooms.get(accountRelayRoom(recipientId));
-        const accountRelayConnected = Boolean(accountRoom?.size);
-        let acknowledgedByApp = false;
-        if (accountRelayConnected) {
-          acknowledgedByApp = await new Promise((resolve) => {
-            io.to(accountRelayRoom(recipientId)).timeout(9_000).emit('incoming-call', invite, (error, responses = []) => {
-              resolve(responses.some((response) => response?.received === true && response?.joinedRoom === true));
+      // Render owns the 40-second ring timer. A foreground account relay joins
+      // the receiver to this Render room before the client starts ringing.
+      const accountRoom = io.sockets.adapter.rooms.get(accountRelayRoom(recipientId));
+      const foregroundRelaySocketIds = [...(accountRoom || [])].filter((socketId) => {
+        const relaySocket = io.sockets.sockets.get(socketId);
+        return relaySocket?.data.pairlinkForeground === true;
+      });
+      let acknowledgedByApp = false;
+      if (foregroundRelaySocketIds.length) {
+        acknowledgedByApp = await new Promise((resolve) => {
+          let remaining = foregroundRelaySocketIds.length;
+          let settled = false;
+          for (const socketId of foregroundRelaySocketIds) {
+            io.to(socketId).timeout(6_000).emit('incoming-call', invite, (error, acknowledgements = []) => {
+              const joined = acknowledgements.some((response) => response?.received === true && response?.joinedRoom === true);
+              if (joined && !settled) {
+                settled = true;
+                resolve(true);
+                return;
+              }
+              remaining -= 1;
+              if (remaining === 0 && !settled) resolve(false);
             });
-          });
-        }
-        if (acknowledgedByApp) {
-          delivery = 'account-relay';
-        } else {
-          delivery = 'push';
-          void sendCallPush(recipientId, invite, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
-        }
+          }
+        });
+      }
+      let delivery = 'push';
+      if (callSessions.get(callId) !== session || session.state !== 'ringing') {
+        delivery = 'account-relay';
+      } else if (acknowledgedByApp) {
+        delivery = 'account-relay';
+        if (session.state === 'ringing') scheduleCallMissedTimeout(session);
+      } else {
+        // A stale RTDB online bit must never suppress the native call push.
+        await sendCallPush(recipientId, invite, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
+        if (callSessions.get(callId) === session && session.state === 'ringing') scheduleCallMissedTimeout(session);
       }
       if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent, delivery });
     } catch (error) {
@@ -423,6 +480,10 @@ io.on('connection', (socket) => {
       const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => socketId !== socket.id);
       const callId = String(data?.callId || '');
       const session = callId ? getLiveCallSession(callId) : null;
+      if (callId && endedCallSessions.has(callId)) {
+        if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false, ended: true });
+        return;
+      }
       if (session && (session.roomId !== room || ![session.callerId, session.recipientId].includes(senderId))) {
         if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
         return;
@@ -467,6 +528,12 @@ io.on('connection', (socket) => {
       }
       touchRoomActivity(room);
       socket.to(room).emit('call-signal', data);
+      if (session && data?.type === 'call-accepted') {
+        io.to(accountRelayRoom(session.recipientId)).emit('call-accepted', {
+          callId: session.callId, acceptedBy: senderId
+        });
+      }
+      if (session && data?.type === 'call-ended') retireCallSession(session);
       if (typeof acknowledge === 'function') acknowledge({ sent: true, peerPresent: true });
     } catch (err) {
       console.error("Call signal error:", err);
