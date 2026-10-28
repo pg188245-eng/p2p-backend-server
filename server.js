@@ -4,9 +4,11 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, sendRenderCallPush } = require('./render-push');
 
-// --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
+// --- FIREBASE ADMIN IMPORTS ---
 const { getAuth } = require('firebase-admin/auth');
 const { getApp } = require('firebase-admin/app');
+const { getDatabase } = require('firebase-admin/database');
+const { getMessaging } = require('firebase-admin/messaging');
 
 const app = express();
 app.use(cors());
@@ -262,7 +264,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- ADMIN WAKE SENDER (Single Clean Event Listener) ---
   // --- ADMIN WAKE SENDER (Direct FCM via Cameras/<cameraName>/fcmToken) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
@@ -271,28 +272,25 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const cameraName = data?.camera || 'Unknown_Cam';
+      const cameraName = String(data?.camera || data?.recipientId || 'Unknown_Cam').trim();
       console.log(`[Wake Trigger] Admin ne camera "${cameraName}" ko jagane ke liye signal bheja hai.`);
 
       const firebaseApp = getApp('pairlink-render-push');
-      const { getDatabase } = require('firebase-admin/database');
-      const { getMessaging } = require('firebase-admin/messaging');
-
       const db = getDatabase(firebaseApp);
 
-      // 1. पहले सेंडर का FCM Token चेक करें जो MainActivity ने सेव किया है
+      // 1. Pehle Sender ka FCM Token check karein jo MainActivity.kt ne save kiya hai
       const tokenSnap = await db.ref(`Cameras/${cameraName}/fcmToken`).get();
       const fcmToken = tokenSnap.val();
 
       if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn(`[Wake Trigger] Camera "${cameraName}" ka FCM token database mein nahi mila!`);
+        console.warn(`[Wake Trigger] Camera "${cameraName}" ka FCM token database (Cameras/${cameraName}/fcmToken) mein nahi mila!`);
         return;
       }
 
-      // 2. cameraWakeQueue में नया नोड (pushKeyId) जनरेट करके डेटा सेव करें
+      // 2. cameraWakeQueue mein naya node (pushKeyId) generate karke data save karein
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
-      const pushKeyId = newPushRef.key;
+      const pushKeyId = String(newPushRef.key || Date.now());
 
       await newPushRef.set({
         action: "WAKE_UP",
@@ -302,15 +300,15 @@ io.on('connection', (socket) => {
 
       console.log(`[Wake Trigger] Firebase 'cameraWakeQueue' mein entry ban gayi, pushKeyId: ${pushKeyId}`);
 
-      // 3. सीधे सेंडर के FCM Token पर High-Priority Data Push भेजें (बिना render-push.js को छुए)
+      // 3. Seedhe Sender ke FCM Token par High-Priority Data Push bhejein (bina render-push.js chhue)
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
           title: "CCTV Wakeup Call",
           body: `Camera ${cameraName} ko turant connect karo!`,
           action: "WAKE_UP",
-          cameraName: String(cameraName),
-          pushKeyId: String(pushKeyId)
+          cameraName: cameraName,
+          pushKeyId: pushKeyId
         },
         android: {
           priority: 'high',
@@ -319,21 +317,6 @@ io.on('connection', (socket) => {
       });
 
       console.log(`[Wake Trigger] "${cameraName}" ko high-priority wake push successfully bhej diya gaya!`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-
-      // रेंडर पुश रिले के जरिए हाई प्रायोरिटी के साथ पुश ट्रिगर करें
-      await sendRenderCallPush(targetRecipientId, pushPayload, {
-        kind: 'wake_up_push',
-        priority: 'high',
-        collapseKey: `wake-${pushKeyId}`,
-        ttlMs: 30_000
-      });
-
-      console.log(`[Wake Trigger] Sender device ko high-priority push notification successfully bhej di gayi hai.`);
 
     } catch (error) {
       console.error("[Wake Trigger] Error in admin_wake_sender:", error);
