@@ -275,51 +275,59 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- ADMIN WAKE SENDER ---
-  // --- ADMIN WAKE SENDER (UPDATED FOR PAIRLINK MERGE) ---
+  
+  // --- ADMIN WAKE SENDER (FINAL & CLEAN - PAIRLINK USERS ONLY) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
-      const cameraName = String(data?.camera || data?.recipientId || 'Hall_Cam').trim();
-      console.log("[Wake Trigger] Request received to wake camera: " + cameraName);
+      const recipientId = String(data?.camera || data?.recipientId || '').trim();
+      console.log("[Wake Trigger] Request received to wake user ID: " + recipientId);
+
+      if (!recipientId) {
+        console.error("[Wake Trigger Error] Recipient ID/Camera name missing!");
+        return;
+      }
 
       const firebaseApp = getApp('pairlink-render-push');
       const db = getDatabase(firebaseApp);
       
-      // 1. Real-time DB में Queue बनाना (Fast command)
+      // 1. Real-time DB में Queue बनाना
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = String(newPushRef.key || Date.now());
 
       await newPushRef.set({
         action: "WAKE_UP",
-        cameraName: cameraName,
+        cameraName: recipientId,
         timestamp: Date.now()
       });
 
       console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
 
-      // 2. (नया फिक्स) Firestore की जगह Real-time Database से FCM Token (Address) निकालना
-      const tokenSnapshot = await db.ref(`Cameras/${cameraName}/fcmToken`).once('value');
+      // 2. सीधे PairLink के 'Users' फोल्डर से उस यूज़र आईडी का FCM Token निकालना
+      const userTokenPath = `Users/${recipientId}/fcmToken`;
+      console.log("[Wake Trigger] Searching token at PairLink path: " + userTokenPath);
+
+      const tokenSnapshot = await db.ref(userTokenPath).once('value');
       const fcmToken = tokenSnapshot.val();
 
       if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn(`[Wake Trigger] '${cameraName}' का नया FCM token Realtime DB में नहीं मिला!`);
+        console.warn(`[Wake Trigger] '${recipientId}' का FCM token 'Users' फोल्डर में नहीं मिला!`);
         return;
       }
 
-      // 3. 100% साइलेंट (Data-Only) Push Notification मारना
+      // 3. 100% साइलेंट Push - WITH DEEP SLEEP BYPASS
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
           action: "WAKE_UP",
-          cameraName: cameraName,
+          cameraName: recipientId,
           pushKeyId: pushKeyId,
-          kind: "wake_camera"
+          kind: "wake_camera" 
         },
         android: {
           priority: 'high',
-          // यह लाइन सबसे ज़रूरी है! यह एंड्रॉइड को फोर्स करती है कि फोन सो रहा हो तब भी ऐप को जगाओ
-          directBootOk: true 
+          ttl: 30000,
+          directBootOk: true // Deep Sleep Bypass
         },
         apns: {
           headers: {
@@ -334,7 +342,7 @@ io.on('connection', (socket) => {
         }
       });
 
-      console.log(`[Wake Trigger] Silent Data-Only FCM push sent successfully to "${cameraName}"!`);
+      console.log(`[Wake Trigger] Silent Data-Only FCM push sent successfully to User ID: "${recipientId}"!`);
 
     } catch (error) {
       console.error("[Wake Trigger] Error in admin_wake_sender:", error);
