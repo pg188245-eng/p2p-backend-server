@@ -263,16 +263,16 @@ io.on('connection', (socket) => {
       if (typeof acknowledge === 'function') acknowledge({ success: false, error: "Sync failed" });
     }
   });
-  // --- ADMIN WAKE SENDER (Clean & Error-Free) ---
+
+  // --- ADMIN WAKE SENDER ---
   socket.on('admin_wake_sender', async (data) => {
     try {
       const cameraName = String(data?.camera || data?.recipientId || 'Hall_Cam').trim();
-      console.log(`[Wake Trigger] Request received to wake camera: "${cameraName}"`);
+      console.log("[Wake Trigger] Request received to wake camera: " + cameraName);
 
       const firebaseApp = getApp('pairlink-render-push');
       const db = getDatabase(firebaseApp);
 
-      // 1. Sabse pehle Firebase Realtime Database mein 'cameraWakeQueue' folder aur entry banayein
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = String(newPushRef.key || Date.now());
@@ -283,14 +283,13 @@ io.on('connection', (socket) => {
         timestamp: Date.now()
       });
 
-      console.log(`[Wake Trigger] Firebase 'cameraWakeQueue/${pushKeyId}' created successfully!`);
+      console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
 
-      // 2. Sender ka FCM Token utha kar Push Notification bhejein
-      const tokenSnap = await db.ref(`Cameras/${cameraName}/fcmToken`).get();
+      const tokenSnap = await db.ref('Cameras/' + cameraName + '/fcmToken').get();
       const fcmToken = tokenSnap.val();
 
       if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn(`[Wake Trigger] Folder ban gaya, lekin Cameras/${cameraName}/fcmToken mein token nahi mila!`);
+        console.warn("[Wake Trigger] FCM token not found for camera: " + cameraName);
         return;
       }
 
@@ -298,7 +297,7 @@ io.on('connection', (socket) => {
         token: fcmToken,
         data: {
           title: "CCTV Wakeup Call",
-          body: `Camera ${cameraName} ko turant connect karo!`,
+          body: "Camera " + cameraName + " ko turant connect karo!",
           action: "WAKE_UP",
           cameraName: cameraName,
           pushKeyId: pushKeyId
@@ -309,6 +308,13 @@ io.on('connection', (socket) => {
         }
       });
 
+      console.log("[Wake Trigger] High-priority FCM push sent successfully!");
+
+    } catch (error) {
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
+    }
+  });
+  
       console.log(`[Wake Trigger] High-priority FCM push sent to "${cameraName}"!`);
 
     } catch (error) {
