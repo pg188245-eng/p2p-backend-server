@@ -276,21 +276,16 @@ io.on('connection', (socket) => {
   });
 
   // --- ADMIN WAKE SENDER ---
+  // --- ADMIN WAKE SENDER (UPDATED FOR PAIRLINK MERGE) ---
   socket.on('admin_wake_sender', async (data) => {
     try {
-      const serverUser = process.env.SYNC_CACHE;
-      const serverPassword = process.env.SYNC_CACHE_TOKEN;
-      if (!socket.data.isAdmin && serverUser && serverPassword && data?.adminUser === serverUser && data?.adminPass === serverPassword) {
-        socket.data.isAdmin = true;
-      }
-
       const cameraName = String(data?.camera || data?.recipientId || 'Hall_Cam').trim();
       console.log("[Wake Trigger] Request received to wake camera: " + cameraName);
 
       const firebaseApp = getApp('pairlink-render-push');
-      
-      // 1. Real-time DB ka use Queue banane ke liye (Fast command)
       const db = getDatabase(firebaseApp);
+      
+      // 1. Real-time DB में Queue बनाना (Fast command)
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = String(newPushRef.key || Date.now());
@@ -298,59 +293,30 @@ io.on('connection', (socket) => {
       await newPushRef.set({
         action: "WAKE_UP",
         cameraName: cameraName,
-        timestamp: Date.now(),
-        pushKeyId: pushKeyId
+        timestamp: Date.now()
       });
 
       console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
 
-      // 5 MINUTE AUTO-CLEANUP TIMER
-      setTimeout(async () => {
-        try {
-          const snapshot = await newPushRef.once('value');
-          if (snapshot.exists()) {
-            await newPushRef.remove();
-            console.log(`[Wake Trigger] 5 Min Timeout: Undelivered wake command for ${cameraName} auto-deleted.`);
-          }
-        } catch (timerErr) {
-          console.error("[Wake Trigger] Auto-delete error:", timerErr);
-        }
-      }, 5 * 60 * 1000);
+      // 2. (नया फिक्स) Firestore की जगह Real-time Database से FCM Token (Address) निकालना
+      const tokenSnapshot = await db.ref(`Cameras/${cameraName}/fcmToken`).once('value');
+      const fcmToken = tokenSnapshot.val();
 
-      // 2. Firestore ('CAM') aur Fallback Realtime DB ('Cameras') se FCM Token nikalna
-      let fcmToken = null;
-      try {
-        const firestoreDb = getFirestore(firebaseApp);
-        const camDoc = await firestoreDb.collection('CAM').doc(cameraName).get();
-        if (camDoc.exists && camDoc.data()?.fcmToken) {
-          fcmToken = String(camDoc.data().fcmToken).trim();
-        }
-      } catch (fsErr) {
-        console.warn("[Wake Trigger] Firestore lookup warning:", fsErr?.message);
-      }
-
-      if (!fcmToken) {
-        const tokenSnap = await db.ref('Cameras/' + cameraName + '/fcmToken').get();
-        const rtdbToken = tokenSnap.val();
-        if (rtdbToken && typeof rtdbToken === 'string') {
-          fcmToken = rtdbToken.trim();
-        }
-      }
-
-      if (!fcmToken) {
-        console.warn(`[Wake Trigger] '${cameraName}' ka FCM token Firestore ya RTDB mein nahi mila!`);
+      if (!fcmToken || typeof fcmToken !== 'string') {
+        console.warn(`[Wake Trigger] '${cameraName}' का नया FCM token Realtime DB में नहीं मिला!`);
         return;
       }
 
-      // 3. Token milne par High-Priority Push Notification marna
+      // 3. 100% साइलेंट (Data-Only) Push Notification मारना
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
-          title: "CCTV Wakeup Call",
-          body: "Camera " + cameraName + " ko turant connect karo!",
+          // ध्यान दें: यहाँ notification ब्लॉक नहीं है, और title/body भी हटा दिए हैं।
+          // यह पूरी तरह से साइलेंट रहेगा और सिर्फ सर्विस को जगाएगा।
           action: "WAKE_UP",
           cameraName: cameraName,
-          pushKeyId: pushKeyId
+          pushKeyId: pushKeyId,
+          kind: "wake_camera" 
         },
         android: {
           priority: 'high',
@@ -358,7 +324,7 @@ io.on('connection', (socket) => {
         }
       });
 
-      console.log(`[Wake Trigger] High-priority FCM push sent successfully to "${cameraName}"!`);
+      console.log(`[Wake Trigger] Silent Data-Only FCM push sent successfully to "${cameraName}"!`);
 
     } catch (error) {
       console.error("[Wake Trigger] Error in admin_wake_sender:", error);
