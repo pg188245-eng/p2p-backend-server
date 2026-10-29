@@ -311,16 +311,26 @@ io.on('connection', (socket) => {
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
-          // ध्यान दें: यहाँ notification ब्लॉक नहीं है, और title/body भी हटा दिए हैं।
-          // यह पूरी तरह से साइलेंट रहेगा और सिर्फ सर्विस को जगाएगा।
           action: "WAKE_UP",
           cameraName: cameraName,
           pushKeyId: pushKeyId,
-          kind: "wake_camera" 
+          kind: "wake_camera"
         },
         android: {
           priority: 'high',
-          ttl: 30000
+          // यह लाइन सबसे ज़रूरी है! यह एंड्रॉइड को फोर्स करती है कि फोन सो रहा हो तब भी ऐप को जगाओ
+          directBootOk: true 
+        },
+        apns: {
+          headers: {
+            "apns-priority": "10",
+            "apns-push-type": "background"
+          }
+        },
+        webpush: {
+          headers: {
+            Urgency: "high"
+          }
         }
       });
 
