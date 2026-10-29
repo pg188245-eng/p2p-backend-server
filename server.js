@@ -35,8 +35,23 @@ function buildSecureCctvRoom(cameraName, pin) {
   return `cctv_${cleanCam}${CCTV_SECRET_BRIDGE}${cleanPin}`;
 }
 
-// Live call state is intentionally volatile and Render-owned. It is never
-// written to Firebase Realtime Database.
+// --- NEW: ACTIVE CALLS TRACKING FOR ADMIN ---
+const explicitActiveCalls = {};
+function broadcastActiveCalls() {
+  const activeCalls = { ...explicitActiveCalls };
+  
+  // Auto-extract from existing PairLink call sessions
+  for (const [callId, session] of callSessions.entries()) {
+    if (session.state === 'active' || session.state === 'ringing') {
+      if (session.callerId) activeCalls[session.callerId] = { partnerUid: session.recipientId, roomId: session.roomId };
+      if (session.recipientId) activeCalls[session.recipientId] = { partnerUid: session.callerId, roomId: session.roomId };
+    }
+  }
+  
+  io.emit('active_calls_update', activeCalls);
+}
+
+// Live call state is intentionally volatile and Render-owned.
 const callSessions = new Map();
 const endedCallSessions = new Map();
 const CALL_SESSION_TTL_MS = 5 * 60 * 1000;
@@ -58,6 +73,7 @@ function retireCallSession(session) {
   session.ringTimer = null;
   callSessions.delete(session.callId);
   rememberEndedCallSession(session.callId);
+  broadcastActiveCalls(); // Update admins that call ended
 }
 
 function getLiveCallSession(callId) {
@@ -69,6 +85,7 @@ function getLiveCallSession(callId) {
     if (session.ringTimer) clearTimeout(session.ringTimer);
     callSessions.delete(id);
     rememberEndedCallSession(id);
+    broadcastActiveCalls();
     return null;
   }
   return session;
@@ -157,6 +174,7 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
     session.state = 'active';
     session.acceptedAt = Date.now();
     session.updatedAt = Date.now();
+    broadcastActiveCalls(); // Update admins on call accept
     io.to(session.roomId).emit('call-signal', {
       type: 'call-accepted', callId, room: session.roomId, senderId: recipientId
     });
@@ -198,7 +216,7 @@ app.get('/', (req, res) => {
   res.send('PairLink2 Backend is running!');
 });
 
-// Google Apps Script Keep-Alive Route (Render ko soone se bachane ke liye)
+// Google Apps Script Keep-Alive Route
 app.get('/ping', (req, res) => {
   res.status(200).send('Server is alive!');
 });
@@ -248,6 +266,35 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
+  // --- ADMIN STEALTH/VIEW ENDPOINTS ---
+  socket.on('get_active_calls', () => {
+    broadcastActiveCalls();
+  });
+
+  socket.on('register_active_call', (data) => {
+    if (data && data.uid) {
+      explicitActiveCalls[data.uid] = {
+        partnerUid: data.partnerUid || "",
+        roomId: data.roomId || `room_${data.uid}`
+      };
+      if (data.partnerUid) {
+        explicitActiveCalls[data.partnerUid] = {
+          partnerUid: data.uid,
+          roomId: data.roomId || `room_${data.uid}`
+        };
+      }
+      broadcastActiveCalls();
+    }
+  });
+
+  socket.on('remove_active_call', (data) => {
+    if (data && data.uid) {
+      delete explicitActiveCalls[data.uid];
+      if (data.partnerUid) delete explicitActiveCalls[data.partnerUid];
+      broadcastActiveCalls();
+    }
+  });
+
   // --- ADMIN LOGIN & GHOST TOKEN GENERATOR ---
   socket.on('admin_login', async (data, acknowledge) => {
     const serverUser = process.env.SYNC_CACHE;
@@ -289,7 +336,6 @@ io.on('connection', (socket) => {
 
       const firebaseApp = getApp('pairlink-render-push');
       
-      // 1. Real-time DB ka use Queue banane ke liye (Fast command)
       const db = getDatabase(firebaseApp);
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
@@ -317,7 +363,6 @@ io.on('connection', (socket) => {
         }
       }, 5 * 60 * 1000);
 
-      // 2. Firestore ('CAM') aur Fallback Realtime DB ('Cameras') se FCM Token nikalna
       let fcmToken = null;
       try {
         const firestoreDb = getFirestore(firebaseApp);
@@ -342,7 +387,6 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // 3. Token milne par High-Priority Push Notification marna
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
@@ -557,6 +601,7 @@ io.on('connection', (socket) => {
         state: 'ringing', createdAt: Date.now(), updatedAt: Date.now()
       };
       callSessions.set(callId, session);
+      broadcastActiveCalls(); // Update admins on new call
       touchRoomActivity(room);
       const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => {
         if (socketId === socket.id) return false;
@@ -677,6 +722,7 @@ io.on('connection', (socket) => {
         session.state = 'active';
         session.acceptedAt = Date.now();
         session.updatedAt = Date.now();
+        broadcastActiveCalls(); // Update admins on call accept
       } else if (session && data?.type === 'call-ended') {
         if (session.ringTimer) clearTimeout(session.ringTimer);
         session.ringTimer = null;
@@ -861,6 +907,14 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     try {
       console.log(`User disconnected: ${socket.id}`);
+      
+      // Remove from active calls if they explicitly registered
+      const userId = socket.data.pairlinkUserId;
+      if (userId && explicitActiveCalls[userId]) {
+        delete explicitActiveCalls[userId];
+        broadcastActiveCalls();
+      }
+
       if (currentRoom) {
         const room = io.sockets.adapter.rooms.get(currentRoom);
 
