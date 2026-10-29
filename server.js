@@ -304,7 +304,7 @@ io.on('connection', (socket) => {
       console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
 
       // 2. सीधे PairLink के 'Users' फोल्डर से उस यूज़र आईडी का FCM Token निकालना
-      const userTokenPath = `Users/${recipientId}/fcmToken`;
+      const userTokenPath = `users/${recipientId}/fcmToken`;
       console.log("[Wake Trigger] Searching token at PairLink path: " + userTokenPath);
 
       const tokenSnapshot = await db.ref(userTokenPath).once('value');
