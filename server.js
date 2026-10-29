@@ -326,13 +326,6 @@ io.on('connection', (socket) => {
     }
   });
 
-      console.log(`[Wake Trigger] High-priority FCM push sent successfully to "${cameraName}"!`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-
   function touchRoomActivity(roomName) {
     if (roomsStore[roomName]) {
       roomsStore[roomName].lastActivityAt = Date.now();
