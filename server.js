@@ -9,6 +9,7 @@ const { getAuth } = require('firebase-admin/auth');
 const { getApp } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
 const { getMessaging } = require('firebase-admin/messaging');
+const { getFirestore } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(cors());
@@ -271,8 +272,9 @@ io.on('connection', (socket) => {
       console.log("[Wake Trigger] Request received to wake camera: " + cameraName);
 
       const firebaseApp = getApp('pairlink-render-push');
+      
+      // 1. Real-time DB ka use sirf Queue banane ke liye (Fast command)
       const db = getDatabase(firebaseApp);
-
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
       const pushKeyId = String(newPushRef.key || Date.now());
@@ -285,14 +287,23 @@ io.on('connection', (socket) => {
 
       console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
 
-      const tokenSnap = await db.ref('Cameras/' + cameraName + '/fcmToken').get();
-      const fcmToken = tokenSnap.val();
+      // 2. Firestore se Address (FCM Token) nikalne ka kaam
+      const firestoreDb = getFirestore(firebaseApp);
+      const camDoc = await firestoreDb.collection('CAM').doc(cameraName).get();
 
-      if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn("[Wake Trigger] FCM token not found for camera: " + cameraName);
+      if (!camDoc.exists) {
+        console.warn(`[Wake Trigger] Firestore mein '${cameraName}' ki book (document) nahi mili! Address missing.`);
         return;
       }
 
+      const fcmToken = camDoc.data().fcmToken;
+
+      if (!fcmToken || typeof fcmToken !== 'string') {
+        console.warn(`[Wake Trigger] '${cameraName}' ki book mili, par usme FCM token (address) nahi hai!`);
+        return;
+      }
+
+      // 3. Token milne par Push Notification marna
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
@@ -307,6 +318,13 @@ io.on('connection', (socket) => {
           ttl: 30000
         }
       });
+
+      console.log(`[Wake Trigger] High-priority FCM push sent successfully to "${cameraName}"!`);
+
+    } catch (error) {
+      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
+    }
+  });
 
       console.log(`[Wake Trigger] High-priority FCM push sent successfully to "${cameraName}"!`);
 
