@@ -282,10 +282,29 @@ io.on('connection', (socket) => {
       await newPushRef.set({
         action: "WAKE_UP",
         cameraName: cameraName,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        pushKeyId: pushKeyId // Unique ID track karne ke liye
       });
 
       console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
+
+      // -------------------------------------------------------------
+      // 5 MINUTE AUTO-CLEANUP TIMER (Smart Garbage Collector)
+      // -------------------------------------------------------------
+      setTimeout(async () => {
+        try {
+          // 5 minute (300,000 ms) ke baad Firebase par check karein
+          const snapshot = await newPushRef.once('value');
+          if (snapshot.exists()) {
+            // Agar entry abhi bhi wahan hai (yani Android app ne ise receive/delete nahi kiya)
+            await newPushRef.remove();
+            console.log(`[Wake Trigger] 5 Min Timeout: Undelivered wake command for ${cameraName} auto-deleted.`);
+          }
+        } catch (timerErr) {
+          console.error("[Wake Trigger] Auto-delete error:", timerErr);
+        }
+      }, 5 * 60 * 1000); // 5 minutes in milliseconds
+      // -------------------------------------------------------------
 
       // 2. Firestore se Address (FCM Token) nikalne ka kaam
       const firestoreDb = getFirestore(firebaseApp);
