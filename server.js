@@ -308,31 +308,7 @@ io.on('connection', (socket) => {
         }
       });
 
-      console.log("[Wake Trigger] High-priority FCM push sent successfully!");
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-  
-      console.log(`[Wake Trigger] High-priority FCM push sent to "${cameraName}"!`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-
-  
-  
-      console.log(`[Wake Trigger] High-priority FCM push sent to "${cameraName}"!`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
-
-      
-      console.log(`[Wake Trigger] "${cameraName}" ko high-priority wake push successfully bhej diya gaya!`);
+      console.log(`[Wake Trigger] High-priority FCM push sent successfully to "${cameraName}"!`);
 
     } catch (error) {
       console.error("[Wake Trigger] Error in admin_wake_sender:", error);
