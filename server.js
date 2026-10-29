@@ -25,6 +25,16 @@ const io = new Server(server, {
   }
 });
 
+// --- CCTV SECRET BRIDGE CONFIG ---
+const CCTV_SECRET_BRIDGE = process.env.CCTV_SECRET_BRIDGE || '_Srm_';
+const DEFAULT_CCTV_PIN = '1199xx!';
+
+function buildSecureCctvRoom(cameraName, pin) {
+  const cleanCam = String(cameraName || 'Hall_Cam').trim();
+  const cleanPin = String(pin || DEFAULT_CCTV_PIN).trim();
+  return `cctv_${cleanCam}${CCTV_SECRET_BRIDGE}${cleanPin}`;
+}
+
 // Live call state is intentionally volatile and Render-owned. It is never
 // written to Firebase Realtime Database.
 const callSessions = new Map();
@@ -243,7 +253,7 @@ io.on('connection', (socket) => {
     const serverUser = process.env.SYNC_CACHE;
     const serverPassword = process.env.SYNC_CACHE_TOKEN;
     
-    if (serverUser && serverPassword && data.username === serverUser && data.password === serverPassword) {
+    if (serverUser && serverPassword && data?.username === serverUser && data?.password === serverPassword) {
       socket.data.isAdmin = true;
       socket.data.pairlinkUserId = "render_health_check";
       
@@ -268,12 +278,18 @@ io.on('connection', (socket) => {
   // --- ADMIN WAKE SENDER ---
   socket.on('admin_wake_sender', async (data) => {
     try {
+      const serverUser = process.env.SYNC_CACHE;
+      const serverPassword = process.env.SYNC_CACHE_TOKEN;
+      if (!socket.data.isAdmin && serverUser && serverPassword && data?.adminUser === serverUser && data?.adminPass === serverPassword) {
+        socket.data.isAdmin = true;
+      }
+
       const cameraName = String(data?.camera || data?.recipientId || 'Hall_Cam').trim();
       console.log("[Wake Trigger] Request received to wake camera: " + cameraName);
 
       const firebaseApp = getApp('pairlink-render-push');
       
-      // 1. Real-time DB ka use sirf Queue banane ke liye (Fast command)
+      // 1. Real-time DB ka use Queue banane ke liye (Fast command)
       const db = getDatabase(firebaseApp);
       const pushQueueRef = db.ref('cameraWakeQueue');
       const newPushRef = pushQueueRef.push();
@@ -283,46 +299,50 @@ io.on('connection', (socket) => {
         action: "WAKE_UP",
         cameraName: cameraName,
         timestamp: Date.now(),
-        pushKeyId: pushKeyId // Unique ID track karne ke liye
+        pushKeyId: pushKeyId
       });
 
       console.log("[Wake Trigger] Firebase cameraWakeQueue entry created successfully!");
 
-      // -------------------------------------------------------------
-      // 5 MINUTE AUTO-CLEANUP TIMER (Smart Garbage Collector)
-      // -------------------------------------------------------------
+      // 5 MINUTE AUTO-CLEANUP TIMER
       setTimeout(async () => {
         try {
-          // 5 minute (300,000 ms) ke baad Firebase par check karein
           const snapshot = await newPushRef.once('value');
           if (snapshot.exists()) {
-            // Agar entry abhi bhi wahan hai (yani Android app ne ise receive/delete nahi kiya)
             await newPushRef.remove();
             console.log(`[Wake Trigger] 5 Min Timeout: Undelivered wake command for ${cameraName} auto-deleted.`);
           }
         } catch (timerErr) {
           console.error("[Wake Trigger] Auto-delete error:", timerErr);
         }
-      }, 5 * 60 * 1000); // 5 minutes in milliseconds
-      // -------------------------------------------------------------
+      }, 5 * 60 * 1000);
 
-      // 2. Firestore se Address (FCM Token) nikalne ka kaam
-      const firestoreDb = getFirestore(firebaseApp);
-      const camDoc = await firestoreDb.collection('CAM').doc(cameraName).get();
+      // 2. Firestore ('CAM') aur Fallback Realtime DB ('Cameras') se FCM Token nikalna
+      let fcmToken = null;
+      try {
+        const firestoreDb = getFirestore(firebaseApp);
+        const camDoc = await firestoreDb.collection('CAM').doc(cameraName).get();
+        if (camDoc.exists && camDoc.data()?.fcmToken) {
+          fcmToken = String(camDoc.data().fcmToken).trim();
+        }
+      } catch (fsErr) {
+        console.warn("[Wake Trigger] Firestore lookup warning:", fsErr?.message);
+      }
 
-      if (!camDoc.exists) {
-        console.warn(`[Wake Trigger] Firestore mein '${cameraName}' ki book (document) nahi mili! Address missing.`);
+      if (!fcmToken) {
+        const tokenSnap = await db.ref('Cameras/' + cameraName + '/fcmToken').get();
+        const rtdbToken = tokenSnap.val();
+        if (rtdbToken && typeof rtdbToken === 'string') {
+          fcmToken = rtdbToken.trim();
+        }
+      }
+
+      if (!fcmToken) {
+        console.warn(`[Wake Trigger] '${cameraName}' ka FCM token Firestore ya RTDB mein nahi mila!`);
         return;
       }
 
-      const fcmToken = camDoc.data().fcmToken;
-
-      if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn(`[Wake Trigger] '${cameraName}' ki book mili, par usme FCM token (address) nahi hai!`);
-        return;
-      }
-
-      // 3. Token milne par Push Notification marna
+      // 3. Token milne par High-Priority Push Notification marna
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
@@ -353,11 +373,41 @@ io.on('connection', (socket) => {
 
   function handleJoinRoom(data) {
     try {
-      const roomName = (typeof data === 'object' && data !== null) ? data.room : data;
+      let roomName = (typeof data === 'object' && data !== null) ? data.room : data;
+      const role = (typeof data === 'object' && data !== null) ? String(data.role || '') : '';
+      const camName = (typeof data === 'object' && data !== null) ? String(data.camera || '').trim() : '';
+      const camPin = (typeof data === 'object' && data !== null) ? String(data.pin || DEFAULT_CCTV_PIN).trim() : DEFAULT_CCTV_PIN;
+
+      // --- CCTV SECRET BRIDGE ('_Srm_') & FIREWALL ---
+      if (camName && (role === 'sender' || role === 'admin')) {
+        if (role === 'admin') {
+          const serverUser = process.env.SYNC_CACHE;
+          const serverPassword = process.env.SYNC_CACHE_TOKEN;
+          if (!socket.data.isAdmin) {
+            if (serverUser && serverPassword && data?.adminUser === serverUser && data?.adminPass === serverPassword) {
+              socket.data.isAdmin = true;
+            } else {
+              console.warn(`[CCTV Firewall] Unauthorized admin join blocked for "${camName}"`);
+              socket.emit('room_locked_error', { message: 'Unauthorized Admin Access!' });
+              return;
+            }
+          }
+          socket.data.isCctvAdmin = true;
+        } else if (role === 'sender') {
+          socket.data.isCctvSender = true;
+        }
+        roomName = buildSecureCctvRoom(camName, camPin);
+        socket.data.isCctvRoom = true;
+      }
+
       const userId = socket.data.isAdmin ? "render_health_check" : ((typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id);
 
       if (!roomName) return;
       socket.data.pairlinkUserId = String(userId);
+
+      if (currentRoom && currentRoom !== roomName) {
+        socket.leave(currentRoom);
+      }
 
       const existingRoom = roomsStore[roomName];
       if (existingRoom && Date.now() - existingRoom.lastActivityAt >= ROOM_EXPIRY_MS) {
@@ -368,7 +418,7 @@ io.on('connection', (socket) => {
         roomsStore[roomName] = { allowedUsers: new Set(), lastActivityAt: Date.now() };
       }
 
-      if (!socket.data.isAdmin) {
+      if (!socket.data.isAdmin && !socket.data.isCctvRoom) {
         if (!roomsStore[roomName].allowedUsers.has(userId)) {
           let regularUsersCount = 0;
           roomsStore[roomName].allowedUsers.forEach(id => {
@@ -394,6 +444,15 @@ io.on('connection', (socket) => {
 
       const room = io.sockets.adapter.rooms.get(roomName);
       const socketsInRoom = room ? Array.from(room) : [];
+
+      if (socket.data.isCctvRoom) {
+        if (socketsInRoom.length >= 2) {
+          io.to(roomName).emit('user_status', { online: true });
+          io.to(roomName).emit('peer-ready', { polite: true });
+        }
+        touchRoomActivity(roomName);
+        return;
+      }
 
       const regularSockets = socketsInRoom.filter(id => {
         const sck = io.sockets.sockets.get(id);
@@ -464,6 +523,10 @@ io.on('connection', (socket) => {
   socket.on('signal', (data) => {
     try {
       if (currentRoom) {
+        if (socket.data.isCctvRoom && !socket.data.isCctvSender && !socket.data.isAdmin) {
+          console.warn(`[CCTV Firewall] Blocked unauthorized signal in room ${currentRoom}`);
+          return;
+        }
         touchRoomActivity(currentRoom);
         socket.to(currentRoom).emit('signal', data);
       }
