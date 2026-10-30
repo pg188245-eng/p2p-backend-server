@@ -89,11 +89,16 @@ function emitCallEnd(session, endedBy, state = 'ended') {
 
   // --- RENDER TO FIREBASE ROOM CLEANUP ON END ---
   try {
-    const firebaseApp = getApp('pairlink-render-push');
-    const db = getDatabase(firebaseApp);
-    db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove().catch(err => {
-      console.error("[Room Sync Error on End]:", err);
-    });
+    if (session.roomId && session.callId) {
+      const firebaseApp = getApp('pairlink-render-push');
+      const db = getDatabase(firebaseApp);
+      
+      db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove().catch(()=>{});
+      
+      const now = Date.now();
+      if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch(()=>{});
+      if (session.recipientId) db.ref(`rooms/${session.roomId}/users/${session.recipientId}`).update({ online: true, lastSeen: now }).catch(()=>{});
+    }
   } catch (syncErr) {
     console.error("[Room Sync Error on End catch]:", syncErr);
   }
@@ -891,9 +896,21 @@ io.on('connection', (socket) => {
     } catch (err) { console.error("Leave room error:", err); }
   });
 
-  socket.on('disconnect', () => {
+  ssocket.on('disconnect', () => {
     try {
       console.log(`User disconnected: ${socket.id}`);
+      const userId = String(socket.data.pairlinkUserId || '');
+
+      // --- NEW FIX: Fansi hui calls ko force end karna ---
+      if (userId) {
+        for (const [cId, session] of callSessions.entries()) {
+          if (session.callerId === userId || session.recipientId === userId) {
+            console.log(`Force ending stuck call ${cId} due to user disconnect.`);
+            emitCallEnd(session, userId, 'ended');
+          }
+        }
+      }
+      // ----------------------------------------
       if (currentRoom) {
         const room = io.sockets.adapter.rooms.get(currentRoom);
 
