@@ -896,7 +896,7 @@ io.on('connection', (socket) => {
     } catch (err) { console.error("Leave room error:", err); }
   });
 
-  ssocket.on('disconnect', () => {
+  socket.on('disconnect', () => {
     try {
       console.log(`User disconnected: ${socket.id}`);
       const userId = String(socket.data.pairlinkUserId || '');
