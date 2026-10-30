@@ -86,6 +86,19 @@ function emitCallEnd(session, endedBy, state = 'ended') {
     type: 'call-ended', callId: session.callId, endedBy: session.endedBy,
     room: session.roomId, senderId: session.endedBy
   });
+
+  // --- RENDER TO FIREBASE ROOM CLEANUP ON END ---
+  try {
+    const firebaseApp = getApp('pairlink-render-push');
+    const db = getDatabase(firebaseApp);
+    db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove().catch(err => {
+      console.error("[Room Sync Error on End]:", err);
+    });
+  } catch (syncErr) {
+    console.error("[Room Sync Error on End catch]:", syncErr);
+  }
+  // ----------------------------------------------
+
   retireCallSession(session);
 }
 
@@ -557,6 +570,26 @@ io.on('connection', (socket) => {
         state: 'ringing', createdAt: Date.now(), updatedAt: Date.now()
       };
       callSessions.set(callId, session);
+        
+      // --- RENDER TO FIREBASE ROOM SYNC (ADMIN PANEL BRIDGE) ---
+      try {
+        const firebaseApp = getApp('pairlink-render-push');
+        const db = getDatabase(firebaseApp);
+        await db.ref(`rooms/${room}/callSessions/${callId}`).set({
+          callerId: callerId,
+          recipientId: recipientId,
+          callerName: session.callerName,
+          media: session.media,
+          createdAt: session.createdAt
+        });
+        await db.ref(`rooms/${room}/users/${callerId}`).set({ online: true, lastSeen: Date.now() });
+        await db.ref(`rooms/${room}/users/${recipientId}`).set({ online: true, lastSeen: Date.now() });
+      } catch (syncErr) {
+        console.error("[Room Sync Error on Start]:", syncErr);
+      }
+      // ---------------------------------------------------------
+
+      touchRoomActivity(room);
       touchRoomActivity(room);
       const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => {
         if (socketId === socket.id) return false;
