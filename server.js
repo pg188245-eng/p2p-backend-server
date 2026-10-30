@@ -895,22 +895,44 @@ io.on('connection', (socket) => {
       }
     } catch (err) { console.error("Leave room error:", err); }
   });
-
+  // Yahan se copy karein (Line 615 ke aas-paas se file ke end tak)
   socket.on('disconnect', () => {
     try {
       console.log(`User disconnected: ${socket.id}`);
       const userId = String(socket.data.pairlinkUserId || '');
 
-      // --- NEW FIX: Fansi hui calls ko force end karna ---
+      // --- 100% DIRECT RTDB CALL ID KILLER ---
       if (userId) {
         for (const [cId, session] of callSessions.entries()) {
+          // Check karo agar disconnect hone wala user is call mein tha
           if (session.callerId === userId || session.recipientId === userId) {
-            console.log(`Force ending stuck call ${cId} due to user disconnect.`);
-            emitCallEnd(session, userId, 'ended');
+            console.log(`Directly deleting stuck call ${cId} from RTDB.`);
+            
+            // 1. Seedhe RTDB se us specific call id ko uda rahe hain
+            try {
+              const firebaseApp = getApp('pairlink-render-push');
+              const db = getDatabase(firebaseApp);
+              
+              // Seedha delete command
+              db.ref(`rooms/${session.roomId}/callSessions/${cId}`).remove().catch(()=>{});
+              
+              // Dono users ka status wapas idle/online kar do
+              const now = Date.now();
+              if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch(()=>{});
+              if (session.recipientId) db.ref(`rooms/${session.roomId}/users/${session.recipientId}`).update({ online: true, lastSeen: now }).catch(()=>{});
+            } catch (dbErr) {
+              console.error("RTDB force delete error:", dbErr);
+            }
+
+            // 2. Server ki RAM se bhi saaf kar do
+            if (session.ringTimer) clearTimeout(session.ringTimer);
+            callSessions.delete(cId);
+            rememberEndedCallSession(cId);
           }
         }
       }
       // ----------------------------------------
+
       if (currentRoom) {
         const room = io.sockets.adapter.rooms.get(currentRoom);
 
@@ -942,3 +964,7 @@ startRenderPushRelay();
 server.listen(PORT, () => {
   console.log(`Server is listening on port ${PORT}`);
 });
+
+
+
+ 
