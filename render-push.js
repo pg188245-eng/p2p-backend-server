@@ -570,6 +570,7 @@ async function processPushQueueItem(snapshot) {
     try {
       const sent = await sendPushToUser(String(item.to || ''), {
         kind: 'missed_call',
+        pushSource: 'pushQueue',
         queueId: String(snapshot.key || ''),
         callId: String(item.callId),
         callerId: String(item.from || ''),
@@ -643,8 +644,10 @@ async function processPushQueueItem(snapshot) {
     }
     return;
   }
-  const profile = item.senderProfile?.notificationAvatar
-    ? item.senderProfile
+  const queuedProfile = item.senderProfile || {};
+  const isQueuedMessage = item.type === 'chat' || item.type === 'chat-alert';
+  const profile = isQueuedMessage && (queuedProfile.notificationAvatar || queuedProfile.photoDataUrl)
+    ? queuedProfile
     : await getPushProfile(item.from);
 
   try {
@@ -652,6 +655,7 @@ async function processPushQueueItem(snapshot) {
       if (item.pushSentAt) return;
       const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
+        pushSource: 'pushQueue',
         queueId: String(snapshot.key || ''),
         roomId: String(item.roomId || ''),
         messageId: String(item.messageId || eventId),
@@ -697,6 +701,7 @@ async function processPushQueueItem(snapshot) {
       if (!latestQueueItem || latestQueueItem.pushSentAt) return;
       const sent = await sendPushToUser(recipientId, {
         kind: 'incoming_message',
+        pushSource: 'pushQueue',
         queueId: String(snapshot.key || eventId),
         roomId: item.roomId || '',
         messageId: eventId,
