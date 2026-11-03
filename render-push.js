@@ -454,15 +454,17 @@ async function processPendingMessage(recipientId, snapshot) {
     ? message.senderProfile
     : await getPushProfile(message.from);
   const sent = await sendPushToUser(recipientId, {
-    kind: 'incoming_message',
-    roomId: message.roomId || '',
-    messageId: message.id || snapshot.key,
-    senderId: message.from,
-    senderName: message.fromName || profile.name || 'PairLink user',
-    senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
-      action: 'sync_chat',
-    encrypted: 'true'
-  }, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId: message.id || snapshot.key });
+  kind: 'incoming_message',
+  queueId: String(snapshot.key || ''),
+  roomId: String(item.roomId || ''),
+  messageId: String(item.messageId || eventId),
+  senderId: String(item.from),
+  senderName: String(item.fromName || profile.name || 'PairLink user'),
+  senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+  pushSource: 'pushQueue', // <--- Yeh wali line yahan add kar dein!
+  action: 'sync_chat',
+  encrypted: 'true'
+}, { ttlMs: MAX_PUSH_AGE_MS, kind: 'encrypted-message-alert', eventId, force: true });
   if (sent > 0) {
     await markProcessed(snapshot.ref);
   }
