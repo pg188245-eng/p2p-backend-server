@@ -665,7 +665,7 @@ io.on('connection', (socket) => {
   });
 
   // --- CALL SIGNALING ROUTER ---
-  socket.on('call-signal', (data, acknowledge) => {
+  socket.on('call-signal', async (data, acknowledge) => {
     try {
       const room = String(currentRoom || '');
       const senderId = String(socket.data.pairlinkUserId || '');
@@ -732,12 +732,21 @@ io.on('connection', (socket) => {
         });
       }
       if (session && data?.type === 'call-ended') {
-        if (callerCancelledWhileRinging) queueMissedCallNotification(session);
-        io.to(accountRelayRoom(session.callerId)).emit('call-ended', { callId: session.callId });
-        io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
-        retireCallSession(session);
-      }
-      if (typeof acknowledge === 'function') acknowledge({ sent: true, peerPresent: true });
+  if (callerCancelledWhileRinging) queueMissedCallNotification(session);
+  io.to(accountRelayRoom(session.callerId)).emit('call-ended', { callId: session.callId });
+  io.to(accountRelayRoom(session.recipientId)).emit('call-ended', { callId: session.callId });
+
+  try {
+    const firebaseApp = getApp('pairlink-render-push');
+    const db = getDatabase(firebaseApp);
+
+    await db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove();
+
+    console.info(`[PairLink call] Deleted RTDB call session ${session.callId}`);
+  } finally {
+    retireCallSession(session);
+  }
+}
     } catch (err) {
       console.error("Call signal error:", err);
       if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
