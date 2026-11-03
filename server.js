@@ -9,7 +9,7 @@ const { getAuth } = require('firebase-admin/auth');
 const { getApp } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
 const { getMessaging } = require('firebase-admin/messaging');
-const { getFirestore } = require('firebase-admin/firestore');  
+const { getFirestore } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(cors());
