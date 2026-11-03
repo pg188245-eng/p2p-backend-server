@@ -601,7 +601,7 @@ io.on('connection', (socket) => {
         return String(io.sockets.sockets.get(socketId)?.data.pairlinkUserId || '') === recipientId;
       });
       const invite = {
-          kind: 'incoming_call', callId, callerId,
+          kind: 'incoming_call', callId, callerId, recipientId,
           callerName: session.callerName,
           senderPhoto: session.callerPhoto,
           roomId: room,
