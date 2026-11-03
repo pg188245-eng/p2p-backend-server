@@ -5,7 +5,6 @@ const { getDatabase } = require('firebase-admin/database');
 const { getFirestore } = require('firebase-admin/firestore');
 const { getMessaging } = require('firebase-admin/messaging');
 
-
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL ||
   'https://pairlink2-default-rtdb.asia-southeast1.firebasedatabase.app';
 const MAX_PUSH_AGE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -14,6 +13,7 @@ const INVALID_TOKEN_CODES = new Set([
   'messaging/registration-token-not-registered',
   'messaging/invalid-registration-token'
 ]);
+
 
 let db;
 let firestore;
