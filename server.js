@@ -65,7 +65,7 @@ function getLiveCallSession(callId) {
   if (endedCallSessions.has(id)) return null;
   const session = callSessions.get(id);
   if (!session) return null;
-  if (Date.now() - session.updatedAt > CALL_SESSION_TTL_MS) {
+  if (session.state !== 'active' && Date.now() - session.updatedAt > CALL_SESSION_TTL_MS) {
     if (session.ringTimer) clearTimeout(session.ringTimer);
     callSessions.delete(id);
     rememberEndedCallSession(id);
@@ -93,7 +93,7 @@ function emitCallEnd(session, endedBy, state = 'ended') {
       const firebaseApp = getApp('pairlink-render-push');
       const db = getDatabase(firebaseApp);
       
-      db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove().catch(()=>{});
+      db.ref(`rooms/${session.roomId}/callSessions/${session.callId}`).remove().catch((error) => console.error(`[PairLink call] Could not remove RTDB call session ${session.callId}:`, error));
       
       const now = Date.now();
       if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch(()=>{});
@@ -910,33 +910,30 @@ io.on('connection', (socket) => {
       console.log(`User disconnected: ${socket.id}`);
       const userId = String(socket.data.pairlinkUserId || '');
 
-      // --- 100% DIRECT RTDB CALL ID KILLER ---
-      if (userId) {
+      // Only the call-room socket ending can end this call; unrelated account sockets cannot.
+      if (userId && currentRoom) {
         for (const [cId, session] of callSessions.entries()) {
-          // Check karo agar disconnect hone wala user is call mein tha
-          if (session.callerId === userId || session.recipientId === userId) {
-            console.log(`Directly deleting stuck call ${cId} from RTDB.`);
-            
-            // 1. Seedhe RTDB se us specific call id ko uda rahe hain
-            try {
-              const firebaseApp = getApp('pairlink-render-push');
-              const db = getDatabase(firebaseApp);
-              
-              // Seedha delete command
-              db.ref(`rooms/${session.roomId}/callSessions/${cId}`).remove().catch(()=>{});
-              
-              // Dono users ka status wapas idle/online kar do
-              const now = Date.now();
-              if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch(()=>{});
-              if (session.recipientId) db.ref(`rooms/${session.roomId}/users/${session.recipientId}`).update({ online: true, lastSeen: now }).catch(()=>{});
-            } catch (dbErr) {
-              console.error("RTDB force delete error:", dbErr);
-            }
+          if ((session.callerId !== userId && session.recipientId !== userId) ||
+              String(session.roomId || '') !== String(currentRoom || '')) continue;
 
-            // 2. Server ki RAM se bhi saaf kar do
-            if (session.ringTimer) clearTimeout(session.ringTimer);
-            callSessions.delete(cId);
-            rememberEndedCallSession(cId);
+          const anotherSocketForUserInCallRoom = [...(io.sockets.adapter.rooms.get(session.roomId) || [])]
+            .some((socketId) => {
+              const otherSocket = io.sockets.sockets.get(socketId);
+              return otherSocket && String(otherSocket.data.pairlinkUserId || '') === userId;
+            });
+          if (anotherSocketForUserInCallRoom) continue;
+
+          console.info(`[PairLink call] Call-room socket disconnected; ending session ${cId}.`);
+          emitCallEnd(session, userId, 'ended');
+
+          try {
+            const firebaseApp = getApp('pairlink-render-push');
+            const db = getDatabase(firebaseApp);
+            const now = Date.now();
+            if (session.callerId) db.ref(`rooms/${session.roomId}/users/${session.callerId}`).update({ online: true, lastSeen: now }).catch((error) => console.error('[PairLink call] Caller presence update failed:', error));
+            if (session.recipientId) db.ref(`rooms/${session.roomId}/users/${session.recipientId}`).update({ online: true, lastSeen: now }).catch((error) => console.error('[PairLink call] Recipient presence update failed:', error));
+          } catch (dbErr) {
+            console.error('[PairLink call] RTDB presence update failed after disconnect:', dbErr);
           }
         }
       }
