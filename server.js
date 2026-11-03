@@ -472,10 +472,12 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const regularSockets = socketsInRoom.filter(id => {
+      const regularSocketByUser = new Map();
+      for (const id of socketsInRoom) {
         const sck = io.sockets.sockets.get(id);
-        return sck && !sck.data.isAdmin;
-      });
+        if (sck && !sck.data.isAdmin) regularSocketByUser.set(String(sck.data.pairlinkUserId || id), id);
+      }
+      const regularSockets = [...regularSocketByUser.values()];
 
       if (regularSockets.length >= 2) {
         io.to(roomName).emit('user_status', { online: true });
@@ -552,6 +554,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('call-start', async (data, acknowledge) => {
+    let startAcknowledged = false;
+    const acknowledgeStart = (response) => {
+      if (startAcknowledged || typeof acknowledge !== 'function') return;
+      startAcknowledged = true;
+      acknowledge(response);
+    };
     try {
       const room = String(currentRoom || '');
       const callerId = String(socket.data.pairlinkUserId || '');
@@ -560,11 +568,11 @@ io.on('connection', (socket) => {
       if (!room || !socket.rooms.has(room) || String(data?.room || '') !== room ||
           !callerId || callerId === recipientId || String(data?.callerId || '') !== callerId ||
           !recipientId || !callId || callId.length > 180) {
-        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'Invalid call request.' });
+        acknowledgeStart({ ok: false, error: 'Invalid call request.' });
         return;
       }
       if (endedCallSessions.has(callId) || callSessions.has(callId)) {
-        if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'This call ID was already used.' });
+        acknowledgeStart({ ok: false, error: 'This call ID was already used.' });
         return;
       }
       const session = {
@@ -576,23 +584,28 @@ io.on('connection', (socket) => {
       };
       callSessions.set(callId, session);
         
-      // --- RENDER TO FIREBASE ROOM SYNC (ADMIN PANEL BRIDGE) ---
+      // Persist the active call record before acknowledging the caller or sending the ring.
+      let callSessionDb;
       try {
-        const firebaseApp = getApp('pairlink-render-push');
-        const db = getDatabase(firebaseApp);
-        await db.ref(`rooms/${room}/callSessions/${callId}`).set({
-          callerId: callerId,
-          recipientId: recipientId,
-          callerName: session.callerName,
-          media: session.media,
-          createdAt: session.createdAt
+        callSessionDb = getDatabase(getApp('pairlink-render-push'));
+        await callSessionDb.ref(`rooms/${room}/callSessions/${callId}`).set({
+          callerId, recipientId, callerName: session.callerName, media: session.media,
+          state: 'ringing', createdAt: session.createdAt
         });
-        await db.ref(`rooms/${room}/users/${callerId}`).set({ online: true, lastSeen: Date.now() });
-        await db.ref(`rooms/${room}/users/${recipientId}`).set({ online: true, lastSeen: Date.now() });
       } catch (syncErr) {
-        console.error("[Room Sync Error on Start]:", syncErr);
+        console.error('[Room Sync Error on Call Start]:', syncErr);
+        callSessions.delete(callId);
+        rememberEndedCallSession(callId);
+        acknowledgeStart({ ok: false, error: 'Could not prepare the call session.' });
+        return;
       }
-      // ---------------------------------------------------------
+
+      acknowledgeStart({ ok: true, callId, state: 'ringing', delivery: 'preparing' });
+      const presenceAt = Date.now();
+      void callSessionDb.ref(`rooms/${room}/users/${callerId}`).update({ online: true, lastSeen: presenceAt })
+        .catch((error) => console.error('[Room Sync Error on Caller Presence]:', error));
+      void callSessionDb.ref(`rooms/${room}/users/${recipientId}`).update({ online: true, lastSeen: presenceAt })
+        .catch((error) => console.error('[Room Sync Error on Recipient Presence]:', error));
 
       touchRoomActivity(room);
       touchRoomActivity(room);
@@ -644,10 +657,10 @@ io.on('connection', (socket) => {
         await sendCallPush(recipientId, invite, { kind: 'call', collapseKey: `call-${callId}`, ttlMs: 45_000 });
         if (callSessions.get(callId) === session && session.state === 'ringing') scheduleCallMissedTimeout(session);
       }
-      if (typeof acknowledge === 'function') acknowledge({ ok: true, peerPresent, delivery });
+      acknowledgeStart({ ok: true, peerPresent, delivery });
     } catch (error) {
       console.error('[PairLink call] Could not create Render call session:', error);
-      if (typeof acknowledge === 'function') acknowledge({ ok: false, error: 'Call setup failed.' });
+      acknowledgeStart({ ok: false, error: 'Call setup failed.' });
     }
   });
 
@@ -673,7 +686,11 @@ io.on('connection', (socket) => {
         if (typeof acknowledge === 'function') acknowledge({ sent: false, peerPresent: false });
         return;
       }
-      const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => socketId !== socket.id);
+      const peerPresent = [...(io.sockets.adapter.rooms.get(room) || [])].some((socketId) => {
+        if (socketId === socket.id) return false;
+        const peerSocket = io.sockets.sockets.get(socketId);
+        return peerSocket && String(peerSocket.data.pairlinkUserId || '') !== senderId;
+      });
       const callId = String(data?.callId || '');
       const session = callId ? getLiveCallSession(callId) : null;
       if (callId && endedCallSessions.has(callId)) {
