@@ -7,7 +7,7 @@ const { getMessaging } = require('firebase-admin/messaging');
 
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL ||
   'https://pairlink2-default-rtdb.asia-southeast1.firebasedatabase.app';
-const MAX_PUSH_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const MAX_PUSH_AGE_MS = 14 * 24 * 60 * 60 * 1000; 
 const DISPATCH_CLAIM_LEASE_MS = 2 * 60 * 1000;
 const INVALID_TOKEN_CODES = new Set([
   'messaging/registration-token-not-registered',
