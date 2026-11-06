@@ -750,9 +750,19 @@ async function processPushQueueItem(snapshot) {
     }
     return;
   }
-  const profile = item.senderProfile?.notificationAvatar
+  let profile = item.senderProfile && typeof item.senderProfile === 'object'
     ? item.senderProfile
-    : await getPushProfile(item.from);
+    : {};
+  if (!profile.notificationAvatar && !profile.photoDataUrl) {
+    try {
+      profile = { ...profile, ...(await getPushProfile(item.from)) };
+    } catch (error) {
+      logPushError(`sender profile lookup failed for queued message ${eventId}; using queue metadata`, error);
+    }
+  }
+  profile.name = profile.name || item.fromName || 'PairLink user';
+  profile.notificationAvatar = profile.notificationAvatar || '';
+  profile.photoDataUrl = profile.photoDataUrl || '';
 
   try {
     if (item.type === 'chat-alert') {
