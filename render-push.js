@@ -565,6 +565,32 @@ function listenForChildAdded(ref, label, handler) {
   }, (error) => logPushError(`${label} listener failed`, error));
 }
 
+function listenForChildChanged(ref, label, handler) {
+  ref.on('child_changed', (snapshot) => {
+    Promise.resolve(handler(snapshot)).catch((error) => logPushError(`${label} handler failed`, error));
+  }, (error) => logPushError(`${label} listener failed`, error));
+}
+
+async function processEndedGroupCallingItem(snapshot) {
+  const item = snapshot.val();
+  if (!item || item.type !== 'group_call' || item.status !== 'ended' || item.endPushSentAt || !item.to || !item.callId) return;
+  const sent = await sendRenderCallPush(String(item.to), {
+    kind: 'call_ended',
+    callId: String(item.callId),
+    roomId: String(item.roomId || item.callId),
+    callerId: String(item.from || ''),
+    callerName: 'Group Call',
+    callType: 'group'
+  }, {
+    ttlMs: 60_000,
+    kind: 'group-call-ended',
+    eventId: `${String(item.callId)}:ended`
+  });
+  await snapshot.ref.transaction((current) => current?.callId === item.callId && current.status === 'ended'
+    ? { ...current, endPushSentAt: Date.now(), endPushAccepted: sent > 0 }
+    : current, undefined, false).catch((error) => logPushError('could not mark group call end push', error));
+}
+
 async function processPushQueueItem(snapshot) {
   const item = snapshot.val();
   if (item?.type === 'missed_call' && item.callId) {
@@ -737,10 +763,9 @@ async function dispatchQueuedMissedCalls(userId) {
   }
   return dispatched;
 }
-// --- NAYA CODE START (calling folder ke liye) ---
 async function processCallingItem(snapshot) {
   const item = snapshot.val();
-  if (!item || !item.to || !item.from || item.pushSentAt) return;
+  if (!item || !item.to || !item.from || item.pushSentAt || item.status === 'ended') return;
 
   const recipientId = String(item.to);
   const eventId = String(snapshot.key);
@@ -753,12 +778,14 @@ async function processCallingItem(snapshot) {
       callId: String(item.callId || eventId),
       roomId: String(item.roomId || item.callId || eventId),
       callerId: String(item.from),
-      callerName: String(item.fromName || profile.name || 'PairLink user'),
+      callerName: isGroup ? 'Group Call' : String(item.fromName || profile.name || 'PairLink user'),
       senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
       callType: String(item.callType || 'audio'),
-      video: String(item.video || 'false')
-    }, { 
-      ttlMs: 60_000, 
+      video: String(item.video || 'false'),
+      createdAt: String(item.createdAt || Date.now()),
+      expiresAt: String(item.expiresAt || '')
+    }, {
+      ttlMs: isGroup ? 30 * 60_000 : 60_000,
       kind: isGroup ? 'incoming-group-call' : 'incoming-call', 
       eventId: String(item.callId || eventId), 
       force: true 
@@ -769,6 +796,34 @@ async function processCallingItem(snapshot) {
     if (sent > 0) {
       await snapshot.ref.transaction((current) =>
         current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
+      if (isGroup) {
+        const ringDeadline = (Number(item.createdAt) || Date.now()) + 40_000;
+        const delay = Math.max(0, ringDeadline - Date.now());
+        setTimeout(() => {
+          snapshot.ref.transaction((current) => current?.callId === item.callId && current.status === 'ringing'
+            ? { ...current, status: 'missed', missedAt: Date.now() }
+            : current, undefined, false).then((result) => {
+              const missed = result?.snapshot?.val();
+              if (!missed || missed.callId !== item.callId || missed.status !== 'missed') return;
+              return db.ref(`users/${recipientId}/groupCallHistory/${String(item.callId)}`).set({
+                id: `group:${String(item.callId)}`,
+                groupId: String(item.callId),
+                roomId: String(item.roomId || item.callId),
+                peerId: String(item.from),
+                peerName: 'Group Call',
+                direction: 'incoming',
+                kind: 'group',
+                status: 'missed',
+                startedAt: Number(item.createdAt) || Date.now(),
+                connectedAt: 0,
+                endedAt: 0,
+                durationSeconds: 0,
+                joinUntil: Number(item.expiresAt) || (Number(item.createdAt || 0) + 30 * 60_000),
+                updatedAt: Date.now()
+              });
+            }).catch((error) => logPushError('group-call ring timeout update failed', error));
+        }, delay).unref?.();
+      }
     } else {
       await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
     }
@@ -776,7 +831,6 @@ async function processCallingItem(snapshot) {
     logPushError(`calling folder dispatch failed for ${recipientId}`, error);
   }
 }
-// --- NAYA CODE END ---
 
 
 function startRenderPushRelay() {
@@ -809,6 +863,7 @@ function startRenderPushRelay() {
         logPushError('calling serial processing error', err);
       });
     });
+    listenForChildChanged(db.ref('calling'), 'calling-end', processEndedGroupCallingItem);
     // --- NAYA CALLING LISTENER END ---
 
     console.info('[PairLink push] Render is listening to pushQueue AND calling for push jobs.');
