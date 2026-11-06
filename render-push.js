@@ -737,6 +737,7 @@ async function dispatchQueuedMissedCalls(userId) {
   }
   return dispatched;
 }
+// --- NAYA CODE START (calling folder ke liye) ---
 async function processCallingItem(snapshot) {
   const item = snapshot.val();
   if (!item || !item.to || !item.from || item.pushSentAt) return;
@@ -775,6 +776,7 @@ async function processCallingItem(snapshot) {
     logPushError(`calling folder dispatch failed for ${recipientId}`, error);
   }
 }
+// --- NAYA CODE END ---
 
 
 function startRenderPushRelay() {
