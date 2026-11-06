@@ -765,7 +765,7 @@ async function dispatchQueuedMissedCalls(userId) {
 }
 async function processCallingItem(snapshot) {
   const item = snapshot.val();
-  if (!item || !item.to || !item.from || item.pushSentAt || item.status === 'ended') return;
+  if (!item || !item.to || !item.from || item.pushSentAt || item.status !== 'ringing') return;
 
   const recipientId = String(item.to);
   const eventId = String(snapshot.key);
@@ -861,6 +861,11 @@ function startRenderPushRelay() {
     listenForChildAdded(db.ref('calling'), 'calling', (snapshot) => {
       callingChain = callingChain.then(() => processCallingItem(snapshot)).catch((err) => {
         logPushError('calling serial processing error', err);
+      });
+    });
+    listenForChildChanged(db.ref('calling'), 'calling-update', (snapshot) => {
+      callingChain = callingChain.then(() => processCallingItem(snapshot)).catch((err) => {
+        logPushError('calling update serial processing error', err);
       });
     });
     listenForChildChanged(db.ref('calling'), 'calling-end', processEndedGroupCallingItem);
