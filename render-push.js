@@ -765,7 +765,7 @@ async function dispatchQueuedMissedCalls(userId) {
 }
 async function processCallingItem(snapshot) {
   const item = snapshot.val();
-  if (!item || !item.to || !item.from || item.pushSentAt || item.status !== 'ringing') return;
+  if (!item || !item.to || !item.from || item.pushSentAt || item.lastPushAttemptAt || item.status !== 'ringing') return;
 
   const recipientId = String(item.to);
   const eventId = String(snapshot.key);
