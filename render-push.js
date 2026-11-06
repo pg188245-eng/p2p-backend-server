@@ -737,6 +737,47 @@ async function dispatchQueuedMissedCalls(userId) {
   }
   return dispatched;
 }
+// --- NAYA CODE START (calling folder ke liye) ---
+async function processCallingItem(snapshot) {
+  const item = snapshot.val();
+  // Agar item nahi hai, ya to/from missing hai, ya push pehle hi bheja ja chuka hai toh ignore karein
+  if (!item || !item.to || !item.from || item.pushSentAt) return;
+
+  const recipientId = String(item.to);
+  const eventId = String(snapshot.key);
+
+  try {
+    const profile = await getPushProfile(item.from);
+    const sent = await sendPushToUser(recipientId, {
+      kind: 'call',
+      callId: String(item.callId || eventId),
+      callerId: String(item.from),
+      callerName: String(item.fromName || profile.name || 'PairLink user'),
+      senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
+      callType: String(item.callType || 'audio'),
+      video: String(item.video || 'false')
+    }, { 
+      ttlMs: 60_000, 
+      kind: 'call', 
+      eventId: String(item.callId || eventId), 
+      force: true 
+    });
+
+    console.info(`[PairLink push] Render sent CALL push from calling folder for recipient ${recipientId}.`);
+
+    if (sent > 0) {
+      // Push send hone ke baad pushSentAt add kar dein taaki dobara na jaye
+      await snapshot.ref.transaction((current) =>
+        current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
+    } else {
+      await snapshot.ref.update({ lastPushAttemptAt: Date.now() }).catch(() => {});
+    }
+  } catch (error) {
+    logPushError(`calling folder dispatch failed for ${recipientId}`, error);
+  }
+}
+// --- NAYA CODE END ---
+
 
 function startRenderPushRelay() {
   try {
@@ -752,13 +793,25 @@ function startRenderPushRelay() {
     db = getDatabase(app);
     firestore = getFirestore(app);
     messaging = getMessaging(app);
+    
+    // Purana pushQueue listener
     let pushQueueChain = Promise.resolve();
     listenForChildAdded(db.ref('pushQueue'), 'pushQueue', (snapshot) => {
       pushQueueChain = pushQueueChain.then(() => processPushQueueItem(snapshot)).catch((err) => {
         logPushError('pushQueue serial processing error', err);
       });
     });
-    console.info('[PairLink push] Render is listening only to root pushQueue for push jobs.');
+
+    // --- YAHAN SE NAYA CALLING LISTENER ADD KAREIN ---
+    let callingChain = Promise.resolve();
+    listenForChildAdded(db.ref('calling'), 'calling', (snapshot) => {
+      callingChain = callingChain.then(() => processCallingItem(snapshot)).catch((err) => {
+        logPushError('calling serial processing error', err);
+      });
+    });
+    // --- NAYA CALLING LISTENER END ---
+
+    console.info('[PairLink push] Render is listening to pushQueue AND calling for push jobs.');
     return true;
   } catch (error) {
     logPushError('could not start Firebase event relay', error);
