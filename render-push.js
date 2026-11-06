@@ -737,19 +737,18 @@ async function dispatchQueuedMissedCalls(userId) {
   }
   return dispatched;
 }
-// --- NAYA CODE START (calling folder ke liye) ---
 async function processCallingItem(snapshot) {
   const item = snapshot.val();
-  // Agar item nahi hai, ya to/from missing hai, ya push pehle hi bheja ja chuka hai toh ignore karein
   if (!item || !item.to || !item.from || item.pushSentAt) return;
 
   const recipientId = String(item.to);
   const eventId = String(snapshot.key);
+  const isGroup = item.callType === 'group' || item.type === 'group_call';
 
   try {
     const profile = await getPushProfile(item.from);
     const sent = await sendPushToUser(recipientId, {
-      kind: item.callType === 'group' ? 'incoming_group_call' : 'incoming_call',
+      kind: isGroup ? 'incoming_group_call' : 'incoming_call',
       callId: String(item.callId || eventId),
       roomId: String(item.roomId || item.callId || eventId),
       callerId: String(item.from),
@@ -759,15 +758,14 @@ async function processCallingItem(snapshot) {
       video: String(item.video || 'false')
     }, { 
       ttlMs: 60_000, 
-      kind: item.callType === 'group' ? 'incoming-group-call' : 'incoming-call', 
+      kind: isGroup ? 'incoming-group-call' : 'incoming-call', 
       eventId: String(item.callId || eventId), 
       force: true 
     });
 
-    console.info(`[PairLink push] Render sent CALL push from calling folder for recipient ${recipientId}.`);
+    console.info(`[PairLink push] Render sent ${isGroup ? 'GROUP' : 'CALL'} push from calling folder for recipient ${recipientId}.`);
 
     if (sent > 0) {
-      // Push send hone ke baad pushSentAt add kar dein taaki dobara na jaye
       await snapshot.ref.transaction((current) =>
         current ? { ...current, pushSentAt: Date.now() } : null, undefined, false).catch(() => null);
     } else {
@@ -777,7 +775,6 @@ async function processCallingItem(snapshot) {
     logPushError(`calling folder dispatch failed for ${recipientId}`, error);
   }
 }
-// --- NAYA CODE END ---
 
 
 function startRenderPushRelay() {
