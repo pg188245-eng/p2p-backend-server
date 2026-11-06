@@ -671,6 +671,11 @@ async function cleanupEndedGroupCallArtifacts() {
 
 async function processPushQueueItem(snapshot) {
   const item = snapshot.val();
+  if (item && (item.type === 'group_call' || item.callType === 'group' || item.kind === 'incoming_group_call')) {
+    console.warn(`[PairLink push] Ignoring misplaced group-call item in pushQueue (${snapshot.key}); group calls are dispatched from calling/.`);
+    await snapshot.ref.remove().catch((error) => logPushError(`could not remove misplaced group-call queue item ${snapshot.key}`, error));
+    return;
+  }
   if (item?.type === 'missed_call' && item.callId) {
     if (item.pushSentAt || missedCallDispatchBusy.has(snapshot.key)) return;
     missedCallDispatchBusy.add(snapshot.key);
@@ -750,19 +755,9 @@ async function processPushQueueItem(snapshot) {
     }
     return;
   }
-  let profile = item.senderProfile && typeof item.senderProfile === 'object'
+  const profile = item.senderProfile?.notificationAvatar
     ? item.senderProfile
-    : {};
-  if (!profile.notificationAvatar && !profile.photoDataUrl) {
-    try {
-      profile = { ...profile, ...(await getPushProfile(item.from)) };
-    } catch (error) {
-      logPushError(`sender profile lookup failed for queued message ${eventId}; using queue metadata`, error);
-    }
-  }
-  profile.name = profile.name || item.fromName || 'PairLink user';
-  profile.notificationAvatar = profile.notificationAvatar || '';
-  profile.photoDataUrl = profile.photoDataUrl || '';
+    : await getPushProfile(item.from);
 
   try {
     if (item.type === 'chat-alert') {
