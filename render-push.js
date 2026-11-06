@@ -9,6 +9,8 @@ const DATABASE_URL = process.env.FIREBASE_DATABASE_URL ||
   'https://pairlink2-default-rtdb.asia-southeast1.firebasedatabase.app';
 const MAX_PUSH_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const DISPATCH_CLAIM_LEASE_MS = 2 * 60 * 1000;
+const ENDED_GROUP_CALL_RETENTION_MS = 60 * 60 * 1000;
+const ENDED_GROUP_CALL_CLEANUP_INTERVAL_MS = 60 * 1000;
 const INVALID_TOKEN_CODES = new Set([
   'messaging/registration-token-not-registered',
   'messaging/invalid-registration-token'
@@ -18,6 +20,7 @@ const INVALID_TOKEN_CODES = new Set([
 let db;
 let firestore;
 let messaging;
+let endedGroupCallCleanupRunning = false;
 const liveCallFallbacks = new Set();
 const inMemoryCallPushDispatches = new Map();
 const missedCallDispatchBusy = new Set();
@@ -591,6 +594,81 @@ async function processEndedGroupCallingItem(snapshot) {
     : current, undefined, false).catch((error) => logPushError('could not mark group call end push', error));
 }
 
+async function cleanupEndedGroupCallArtifacts() {
+  if (!db || endedGroupCallCleanupRunning) return;
+  endedGroupCallCleanupRunning = true;
+  const now = Date.now();
+  try {
+    const groupsSnapshot = await db.ref('group').get();
+    const expiredGroupIds = new Set();
+    const expiredGroupHistoryUsers = new Map();
+    const cleanupJobs = [];
+    const rememberGroupHistoryUser = (groupId, userId) => {
+      const id = String(groupId || '');
+      const uid = String(userId || '');
+      if (!id || !uid) return;
+      if (!expiredGroupHistoryUsers.has(id)) expiredGroupHistoryUsers.set(id, new Set());
+      expiredGroupHistoryUsers.get(id).add(uid);
+    };
+
+    groupsSnapshot.forEach((child) => {
+      const group = child.val();
+      if (!group || group.ended !== true) return;
+      const endedAt = Number(group.endedAt || 0);
+      if (!endedAt) {
+        cleanupJobs.push(child.ref.transaction((current) =>
+          current?.ended === true && !Number(current.endedAt || 0)
+            ? { ...current, endedAt: now }
+            : current, undefined, false));
+        return;
+      }
+      if (now - endedAt < ENDED_GROUP_CALL_RETENTION_MS) return;
+      expiredGroupIds.add(String(child.key));
+      Object.keys(group.users || {}).forEach((uid) => rememberGroupHistoryUser(child.key, uid));
+      Object.keys(group.recipients || {}).forEach((uid) => rememberGroupHistoryUser(child.key, uid));
+      cleanupJobs.push(child.ref.remove());
+    });
+
+    const callingSnapshot = await db.ref('calling').get();
+    callingSnapshot.forEach((child) => {
+      const invite = child.val();
+      if (!invite || invite.type !== 'group_call' || !invite.callId) return;
+      if (expiredGroupIds.has(String(invite.callId))) {
+        rememberGroupHistoryUser(invite.callId, invite.to || child.key);
+        cleanupJobs.push(child.ref.remove());
+        return;
+      }
+      if (invite.status !== 'ended') return;
+      const endedAt = Number(invite.endedAt || 0);
+      if (!endedAt) {
+        cleanupJobs.push(child.ref.transaction((current) =>
+          current?.type === 'group_call' && current.status === 'ended' && !Number(current.endedAt || 0)
+            ? { ...current, endedAt: now }
+            : current, undefined, false));
+        return;
+      }
+      if (now - endedAt >= ENDED_GROUP_CALL_RETENTION_MS) {
+        rememberGroupHistoryUser(invite.callId, invite.to || child.key);
+        cleanupJobs.push(child.ref.remove());
+      }
+    });
+
+    await Promise.all(cleanupJobs);
+    const historyCleanupJobs = [];
+    for (const [groupId, userIds] of expiredGroupHistoryUsers) {
+      for (const userId of userIds) {
+        historyCleanupJobs.push(db.ref(`users/${userId}/groupCallHistory/${groupId}`).transaction((entry) =>
+          entry ? { ...entry, joinUntil: 0, updatedAt: now } : entry, undefined, false));
+      }
+    }
+    await Promise.all(historyCleanupJobs);
+  } catch (error) {
+    logPushError('ended group call cleanup failed', error);
+  } finally {
+    endedGroupCallCleanupRunning = false;
+  }
+}
+
 async function processPushQueueItem(snapshot) {
   const item = snapshot.val();
   if (item?.type === 'missed_call' && item.callId) {
@@ -818,7 +896,7 @@ async function processCallingItem(snapshot) {
                 connectedAt: 0,
                 endedAt: 0,
                 durationSeconds: 0,
-                joinUntil: Number(item.expiresAt) || (Number(item.createdAt || 0) + 30 * 60_000),
+                joinUntil: Number.MAX_SAFE_INTEGER,
                 updatedAt: Date.now()
               });
             }).catch((error) => logPushError('group-call ring timeout update failed', error));
@@ -869,6 +947,11 @@ function startRenderPushRelay() {
       });
     });
     listenForChildChanged(db.ref('calling'), 'calling-end', processEndedGroupCallingItem);
+    void cleanupEndedGroupCallArtifacts();
+    const endedGroupCallCleanupTimer = setInterval(() => {
+      void cleanupEndedGroupCallArtifacts();
+    }, ENDED_GROUP_CALL_CLEANUP_INTERVAL_MS);
+    endedGroupCallCleanupTimer.unref?.();
     // --- NAYA CALLING LISTENER END ---
 
     console.info('[PairLink push] Render is listening to pushQueue AND calling for push jobs.');
