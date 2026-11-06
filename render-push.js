@@ -749,8 +749,9 @@ async function processCallingItem(snapshot) {
   try {
     const profile = await getPushProfile(item.from);
     const sent = await sendPushToUser(recipientId, {
-      kind: 'call',
+      kind: item.callType === 'group' ? 'incoming_group_call' : 'incoming_call',
       callId: String(item.callId || eventId),
+      roomId: String(item.roomId || item.callId || eventId),
       callerId: String(item.from),
       callerName: String(item.fromName || profile.name || 'PairLink user'),
       senderPhoto: compactPhoto(profile.notificationAvatar, profile.photoDataUrl),
@@ -758,7 +759,7 @@ async function processCallingItem(snapshot) {
       video: String(item.video || 'false')
     }, { 
       ttlMs: 60_000, 
-      kind: 'call', 
+      kind: item.callType === 'group' ? 'incoming-group-call' : 'incoming-call', 
       eventId: String(item.callId || eventId), 
       force: true 
     });
