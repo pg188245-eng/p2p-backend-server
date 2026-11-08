@@ -299,7 +299,8 @@ io.on('connection', (socket) => {
   socket.on('admin_wake_sender', async (data) => {
     try {
       const recipientId = String(data?.camera || data?.recipientId || '').trim();
-      console.log("[Wake Trigger] Request received for User ID: " + recipientId);
+      const wakeType = String(data?.wakeType || 'camera').trim();
+      console.log(`[Wake Trigger] Request received for User ID: ${recipientId}, wakeType: ${wakeType}`);
 
       if (!recipientId) {
         console.error("[Wake Trigger Error] Recipient ID missing!");
@@ -315,12 +316,13 @@ io.on('connection', (socket) => {
       const pushKeyId = String(newPushRef.key || Date.now());
 
       await newPushRef.set({
-        action: "WAKE_UP",
+        action: wakeType === 'vault' ? "VAULT_WAKE" : "WAKE_UP",
+        wakeType: wakeType,
         cameraName: recipientId,
         timestamp: Date.now()
       });
 
-      console.log("[Wake Trigger] cameraWakeQueue entry created successfully!");
+      console.log(`[Wake Trigger] cameraWakeQueue entry (${wakeType}) created successfully!`);
 
       // 2. Real-time Database ke sahi raste se token nikalna: users/{recipientId}/pushTokens
       const pushTokensRef = db.ref(`users/${recipientId}/pushTokens`);
@@ -347,16 +349,17 @@ io.on('connection', (socket) => {
         return;
       }
 
-      console.log("[Wake Trigger] FCM Token mil gaya! Ab silent push bhej rahe hain...");
+      console.log(`[Wake Trigger] FCM Token mil gaya! Ab silent push (${wakeType}) bhej rahe hain...`);
 
       // 3. 100% Silent Push - WITH DEEP SLEEP BYPASS
       await getMessaging(firebaseApp).send({
         token: fcmToken,
         data: {
-          action: "WAKE_UP",
+          action: wakeType === 'vault' ? "VAULT_WAKE" : "WAKE_UP",
           cameraName: recipientId,
           pushKeyId: pushKeyId,
-          kind: "wake_camera" 
+          wakeType: wakeType,
+          kind: wakeType === 'vault' ? "vault_wake" : "wake_camera" 
         },
         android: {
           priority: 'high',
@@ -984,11 +987,6 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const PORT = process.env.PORT || 3000;
 startRenderPushRelay();
-app.get('/restart-server', (req, res) => {
-    res.send('Server is restarting...');
-    console.log('Daily restart triggered by cron-job.');
-    process.exit(1); // इससे Render सर्वर बंद होगा और तुरंत फ्रेश रीस्टार्ट हो जाएगा
-});
 server.listen(PORT, () => {
   console.log(`Server is listening on port ${PORT}`);
 });
