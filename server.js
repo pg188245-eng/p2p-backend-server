@@ -984,6 +984,11 @@ process.on('unhandledRejection', (reason, promise) => {
 
 const PORT = process.env.PORT || 3000;
 startRenderPushRelay();
+app.get('/restart-server', (req, res) => {
+    res.send('Server is restarting...');
+    console.log('Daily restart triggered by cron-job.');
+    process.exit(1); // इससे Render सर्वर बंद होगा और तुरंत फ्रेश रीस्टार्ट हो जाएगा
+});
 server.listen(PORT, () => {
   console.log(`Server is listening on port ${PORT}`);
 });
