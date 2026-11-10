@@ -985,6 +985,88 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('UNHANDLED REJECTION PREVENTED:', reason);
 });
 
+// GLOBAL CRASH PREVENTER
+process.on('uncaughtException', (err) => {
+  console.error('CRITICAL ERROR PREVENTED:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION PREVENTED:', reason);
+});
+
+// =========================================================================
+// PLAN B (CCTV FALLBACK) - ISOLATED FIREBASE LISTENER
+// =========================================================================
+function startCctvFallbackListener() {
+  try {
+    const firebaseApp = getApp('pairlink-render-push');
+    const db = getDatabase(firebaseApp);
+    const messaging = getMessaging(firebaseApp);
+
+    console.log("[Plan B] CCTV Fallback Listener Started...");
+
+    db.ref('CCTV_Fallback').on('child_added', async (snapshot) => {
+      const deviceId = snapshot.key;
+      const data = snapshot.val();
+      
+      if (!data) return;
+
+      let actionType = "";
+      if (data.action === "START") actionType = "fallback_wakeup";
+      else if (data.action === "STOP") actionType = "fallback_stop";
+
+      if (actionType !== "") {
+        try {
+          const pushTokensRef = db.ref(`users/${deviceId}/pushTokens`);
+          const tokenSnapshot = await pushTokensRef.once('value');
+          const tokensObj = tokenSnapshot.val();
+
+          let fcmToken = null;
+          if (tokensObj && typeof tokensObj === 'object') {
+            const tokenKeys = Object.keys(tokensObj);
+            if (tokenKeys.length > 0) fcmToken = tokensObj[tokenKeys[0]].token;
+          }
+
+          if (!fcmToken) {
+            const directSnap = await db.ref(`users/${deviceId}/fcmToken`).once('value');
+            if (directSnap.exists()) fcmToken = directSnap.val();
+          }
+
+          if (!fcmToken || typeof fcmToken !== 'string') {
+            console.warn(`[Plan B] Device ID '${deviceId}' ka koi FCM token nahi mila!`);
+            return; 
+          }
+
+          const payload = {
+            data: {
+              "action_type": actionType,
+              "admin_id": String(data.admin_id || "admin_master"),
+              "target_id": deviceId
+            },
+            android: {
+              priority: 'high',
+              ttl: 30000,
+              directBootOk: true 
+            }
+          };
+
+          await messaging.send({ token: fcmToken, ...payload });
+          console.log(`[Plan B] FCM Sent to ${deviceId}. Ab phone khud delete karega!`);
+          
+        } catch (err) {
+          console.error(`[Plan B] Error sending push to ${deviceId}:`, err);
+        }
+      }
+    });
+  } catch (error) {
+    console.error("[Plan B] Listener Initialization Error:", error);
+  }
+}
+
+// सर्वर स्टार्ट होते ही लिसनर चालू
+startCctvFallbackListener();
+// =========================================================================
+
 const PORT = process.env.PORT || 3000;
 startRenderPushRelay();
 server.listen(PORT, () => {
